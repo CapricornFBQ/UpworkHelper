@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Upwork Opportunity Scorer",
+  "description": "Manually capture Upwork pages into opportunity sessions and score them with OpenAI.",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "Upwork Scorer",
+    "default_popup": "src/popup/popup.html"
+  },
+  "background": {
+    "service_worker": "src/background/background.js",
+    "type": "module"
+  },
+  "options_page": "src/options/options.html",
+  "side_panel": {
+    "default_path": "src/sidepanel/sidepanel.html"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "sidePanel",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.upwork.com/*",
+    "https://api.openai.com/*"
+  ]
+}

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Upwork Scorer</title>
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body class="popup">
+    <header class="toolbar">
+      <div>
+        <h1>Opportunity Scorer</h1>
+        <p id="statusText">Ready</p>
+      </div>
+      <button id="openOptions" class="icon-button" title="Options">⚙</button>
+    </header>
+
+    <section class="panel">
+      <label for="opportunitySelect">Append to</label>
+      <select id="opportunitySelect">
+        <option value="">New opportunity</option>
+      </select>
+      <div class="button-row">
+        <button id="captureButton" class="primary">Capture current page</button>
+        <button id="openPanelButton">Open panel</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Recent</h2>
+      <div id="recentList" class="list empty">No opportunities yet.</div>
+    </section>
+
+    <script type="module" src="./popup.js"></script>
+  </body>
+</html>

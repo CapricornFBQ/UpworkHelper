@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Upwork Scorer Options</title>
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body class="page">
+    <main class="shell">
+      <header class="page-header">
+        <h1>Settings</h1>
+        <p>Local Chrome extension settings. The API key is stored in Chrome local extension storage.</p>
+      </header>
+
+      <form id="settingsForm" class="settings-form">
+        <label>
+          OpenAI API Key
+          <input id="apiKey" type="password" autocomplete="off" placeholder="sk-...">
+        </label>
+
+        <div class="grid-2">
+          <label>
+            Extract model
+            <input id="extractModel" type="text" value="gpt-5-mini">
+          </label>
+          <label>
+            Score model
+            <input id="scoreModel" type="text" value="gpt-5.2">
+          </label>
+        </div>
+
+        <div class="grid-2">
+          <label>
+            Language
+            <select id="language">
+              <option value="zh-CN">Chinese</option>
+              <option value="en-US">English</option>
+              <option value="bilingual">Bilingual</option>
+            </select>
+          </label>
+          <label>
+            Reasoning effort
+            <select id="reasoningEffort">
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="button-row">
+          <button class="primary" type="submit">Save</button>
+          <span id="saveStatus" class="muted"></span>
+        </div>
+      </form>
+    </main>
+
+    <script type="module" src="./options.js"></script>
+  </body>
+</html>

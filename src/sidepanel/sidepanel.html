@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Opportunity</title>
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body class="sidepanel">
+    <header class="toolbar sticky">
+      <div>
+        <h1>Opportunity</h1>
+        <p id="panelStatus">Ready</p>
+      </div>
+      <button id="refreshButton" class="icon-button" title="Refresh">↻</button>
+    </header>
+
+    <main>
+      <section class="panel">
+        <label for="opportunitySelect">Opportunity</label>
+        <select id="opportunitySelect"></select>
+        <div class="button-row">
+          <button id="captureButton">Capture page</button>
+          <button id="scoreButton" class="primary">Score</button>
+          <button id="deleteButton" class="danger">Delete</button>
+        </div>
+      </section>
+
+      <section id="summaryPanel" class="panel"></section>
+
+      <section class="panel">
+        <label for="notesInput">Your notes</label>
+        <textarea id="notesInput" rows="5" placeholder="Add fit, rate, strategy, or constraints..."></textarea>
+        <div class="button-row">
+          <button id="saveNotesButton">Save notes</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Snapshots</h2>
+        <div id="snapshotsList" class="list empty">No snapshots.</div>
+      </section>
+
+      <section class="panel">
+        <h2>Score details</h2>
+        <div id="detailsPanel" class="details empty">No score yet.</div>
+      </section>
+    </main>
+
+    <script type="module" src="./sidepanel.js"></script>
+  </body>
+</html>

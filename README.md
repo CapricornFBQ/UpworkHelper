@@ -1,0 +1,46 @@
+# Upwork Opportunity Scorer
+
+Local Chrome MV3 extension for manually capturing Upwork pages into opportunity sessions and scoring them with OpenAI.
+
+## Current scope
+
+- User-triggered DOM capture only.
+- No automatic refresh, crawling, bulk scanning, or proposal submission.
+- One opportunity can contain multiple page snapshots.
+- OpenAI API key is stored in Chrome local extension storage and only used by the background service worker.
+- Captured page text and analysis history stay in local Chrome extension storage.
+
+## Load in Chrome
+
+1. Open `chrome://extensions`.
+2. Enable Developer mode.
+3. Click `Load unpacked`.
+4. Select this folder: `/Users/fanbingqi/Downloads/1_Project/29_upworkHelper`.
+5. Open extension options and set your OpenAI API key.
+
+## Workflow
+
+1. Open an Upwork job or related client page.
+2. Click the extension icon.
+3. Choose `New opportunity` or an existing opportunity.
+4. Click `Capture current page`.
+5. Open the side panel and click `Score`.
+
+If an Upwork job key can be recognized from the current URL, repeated captures of the same job are automatically appended to the same opportunity.
+
+## Default models
+
+- Extraction: `gpt-5-mini`
+- Scoring: `gpt-5.2`
+- API: OpenAI Responses API
+
+Use `gpt-5-mini` for both fields if you want a cheaper first pass.
+
+## Safety boundary
+
+The extension is intentionally manual:
+
+- It does not run in the background on Upwork pages.
+- It does not poll or monitor page changes.
+- It does not open pages automatically.
+- It does not click, message, or submit proposals.
