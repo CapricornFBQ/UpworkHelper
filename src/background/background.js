@@ -26,8 +26,6 @@ const BACKUP_PREFIX = "uosc_backup_v0_to_v1_";
 const SCORE_DECISIONS = ["strong_apply", "targeted_apply", "only_if_strong_fit", "skip"];
 const MANAGED_STORAGE_KEYS = Object.freeze(Object.values(STORAGE_KEYS));
 const UNIMPLEMENTED_IMPORT_KEYS = Object.freeze([
-  STORAGE_KEYS.myProfile,
-  STORAGE_KEYS.portfolioCases,
   STORAGE_KEYS.proposalDrafts,
   STORAGE_KEYS.outcomeEvents,
   STORAGE_KEYS.clientRecords,
@@ -60,6 +58,28 @@ async function handleMessage(message) {
       return { ok: true, settings: await getSettings() };
     case "settings:save":
       return { ok: true, settings: await saveSettings(message.settings || {}) };
+    case "myProfile:get":
+      return { ok: true, profile: await getMyProfile() };
+    case "myProfile:save":
+      return { ok: true, profile: await saveMyProfile(message.profile || message.myProfile || {}) };
+    case "myProfile:clear":
+      await clearMyProfile();
+      return { ok: true };
+    case "myProfile:listVersions":
+      return { ok: true, profiles: await listMyProfileVersions() };
+    case "portfolio:list":
+      return { ok: true, portfolioCases: await listPortfolioCases({ includeArchived: Boolean(message.includeArchived) }) };
+    case "portfolio:get":
+      return { ok: true, portfolioCase: await getPortfolioCase(message.id) };
+    case "portfolio:create":
+      return { ok: true, portfolioCase: await createPortfolioCase(message.portfolioCase || message.case || {}) };
+    case "portfolio:update":
+      return { ok: true, portfolioCase: await updatePortfolioCase(message.id, message.portfolioCase || message.case || {}) };
+    case "portfolio:archive":
+    case "portfolio:delete":
+      return { ok: true, portfolioCase: await archivePortfolioCase(message.id) };
+    case "portfolio:clear":
+      return { ok: true, archivedCount: await clearPortfolioCases() };
     case "data:getStorageUsage":
       return { ok: true, usage: await getStorageUsage() };
     case "snapshots:getRetentionSummary":
@@ -344,6 +364,184 @@ function normalizeSettings(rawSettings = {}) {
     ...(settings.exportPreferences || {})
   };
   return settings;
+}
+
+async function getMyProfile() {
+  const data = await chrome.storage.local.get(STORAGE_KEYS.myProfile);
+  return data[STORAGE_KEYS.myProfile] || null;
+}
+
+async function saveMyProfile(profileInput) {
+  return withStorageLock(async () => {
+    const current = await getMyProfile();
+    const now = new Date().toISOString();
+    const profile = normalizeMyProfileInput(profileInput, current, now);
+    await chrome.storage.local.set({ [STORAGE_KEYS.myProfile]: profile });
+    await bumpStorageRevision();
+    return profile;
+  });
+}
+
+async function clearMyProfile() {
+  return withStorageLock(async () => {
+    await chrome.storage.local.set({ [STORAGE_KEYS.myProfile]: null });
+    await bumpStorageRevision();
+  });
+}
+
+async function listMyProfileVersions() {
+  const profile = await getMyProfile();
+  return profile ? [profile] : [];
+}
+
+async function listPortfolioCases({ includeArchived = false } = {}) {
+  const data = await chrome.storage.local.get(STORAGE_KEYS.portfolioCases);
+  const cases = Array.isArray(data[STORAGE_KEYS.portfolioCases]) ? data[STORAGE_KEYS.portfolioCases] : [];
+  return cases
+    .filter((item) => includeArchived || !item.archivedAt)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
+}
+
+async function getPortfolioCase(id) {
+  if (!id) return null;
+  const cases = await listPortfolioCases({ includeArchived: true });
+  return cases.find((item) => item.id === id) || null;
+}
+
+async function createPortfolioCase(caseInput) {
+  return withStorageLock(async () => {
+    const data = await chrome.storage.local.get(STORAGE_KEYS.portfolioCases);
+    const cases = Array.isArray(data[STORAGE_KEYS.portfolioCases]) ? data[STORAGE_KEYS.portfolioCases] : [];
+    const now = new Date().toISOString();
+    const portfolioCase = normalizePortfolioCaseInput(caseInput, null, now);
+    cases.push(portfolioCase);
+    await chrome.storage.local.set({ [STORAGE_KEYS.portfolioCases]: cases });
+    await bumpStorageRevision();
+    return portfolioCase;
+  });
+}
+
+async function updatePortfolioCase(id, caseInput) {
+  if (!id) throw new Error("Portfolio case id is required");
+  return withStorageLock(async () => {
+    const data = await chrome.storage.local.get(STORAGE_KEYS.portfolioCases);
+    const cases = Array.isArray(data[STORAGE_KEYS.portfolioCases]) ? data[STORAGE_KEYS.portfolioCases] : [];
+    const index = cases.findIndex((item) => item.id === id);
+    if (index === -1) throw new Error("Portfolio case not found");
+    const now = new Date().toISOString();
+    const portfolioCase = normalizePortfolioCaseInput(caseInput, cases[index], now);
+    cases[index] = portfolioCase;
+    await chrome.storage.local.set({ [STORAGE_KEYS.portfolioCases]: cases });
+    await bumpStorageRevision();
+    return portfolioCase;
+  });
+}
+
+async function archivePortfolioCase(id) {
+  if (!id) throw new Error("Portfolio case id is required");
+  return withStorageLock(async () => {
+    const data = await chrome.storage.local.get(STORAGE_KEYS.portfolioCases);
+    const cases = Array.isArray(data[STORAGE_KEYS.portfolioCases]) ? data[STORAGE_KEYS.portfolioCases] : [];
+    const index = cases.findIndex((item) => item.id === id);
+    if (index === -1) throw new Error("Portfolio case not found");
+    const now = new Date().toISOString();
+    cases[index] = {
+      ...cases[index],
+      version: Number(cases[index].version || 1) + 1,
+      updatedAt: now,
+      archivedAt: now
+    };
+    await chrome.storage.local.set({ [STORAGE_KEYS.portfolioCases]: cases });
+    await bumpStorageRevision();
+    return cases[index];
+  });
+}
+
+async function clearPortfolioCases() {
+  return withStorageLock(async () => {
+    const data = await chrome.storage.local.get(STORAGE_KEYS.portfolioCases);
+    const cases = Array.isArray(data[STORAGE_KEYS.portfolioCases]) ? data[STORAGE_KEYS.portfolioCases] : [];
+    const now = new Date().toISOString();
+    let archivedCount = 0;
+    const nextCases = cases.map((item) => {
+      if (item.archivedAt) return item;
+      archivedCount += 1;
+      return {
+        ...item,
+        version: Number(item.version || 1) + 1,
+        updatedAt: now,
+        archivedAt: now
+      };
+    });
+    await chrome.storage.local.set({ [STORAGE_KEYS.portfolioCases]: nextCases });
+    await bumpStorageRevision();
+    return archivedCount;
+  });
+}
+
+function normalizeMyProfileInput(input = {}, current = null, now = new Date().toISOString()) {
+  return {
+    id: current?.id || input.id || crypto.randomUUID(),
+    schemaVersion: SCHEMA_VERSION,
+    version: Number(current?.version || 0) + 1,
+    createdAt: current?.createdAt || input.createdAt || now,
+    updatedAt: now,
+    displayName: normalizeText(input.displayName ?? current?.displayName),
+    title: normalizeText(input.title ?? current?.title),
+    summary: normalizeText(input.summary ?? current?.summary),
+    skillTags: normalizeStringList(input.skillTags ?? current?.skillTags),
+    serviceCategories: normalizeStringList(input.serviceCategories ?? current?.serviceCategories),
+    strengths: normalizeStringList(input.strengths ?? current?.strengths),
+    preferredProjects: normalizeStringList(input.preferredProjects ?? current?.preferredProjects),
+    rejectRules: normalizeStringList(input.rejectRules ?? current?.rejectRules),
+    rateCard: normalizeRateCard(input.rateCard ?? current?.rateCard),
+    availability: normalizeText(input.availability ?? current?.availability),
+    proposalPreferences: normalizeStringList(input.proposalPreferences ?? current?.proposalPreferences),
+    languagePreferences: normalizeStringList(input.languagePreferences ?? current?.languagePreferences),
+    archivedAt: null
+  };
+}
+
+function normalizePortfolioCaseInput(input = {}, current = null, now = new Date().toISOString()) {
+  const title = normalizeText(input.title ?? current?.title);
+  if (!title) throw new Error("Portfolio case title is required");
+  return {
+    id: current?.id || input.id || crypto.randomUUID(),
+    schemaVersion: SCHEMA_VERSION,
+    version: Number(current?.version || 0) + 1,
+    createdAt: current?.createdAt || input.createdAt || now,
+    updatedAt: now,
+    title,
+    summary: normalizeText(input.summary ?? current?.summary),
+    skillTags: normalizeStringList(input.skillTags ?? current?.skillTags),
+    outcome: normalizeText(input.outcome ?? current?.outcome),
+    proofPoints: normalizeStringList(input.proofPoints ?? current?.proofPoints),
+    links: normalizeStringList(input.links ?? current?.links),
+    applicableKeywords: normalizeStringList(input.applicableKeywords ?? current?.applicableKeywords),
+    sourceRefs: Array.isArray(input.sourceRefs) ? input.sourceRefs : (Array.isArray(current?.sourceRefs) ? current.sourceRefs : []),
+    archivedAt: null
+  };
+}
+
+function normalizeRateCard(rateCard = {}) {
+  return {
+    currency: normalizeText(rateCard.currency || "USD"),
+    hourlyRateText: normalizeText(rateCard.hourlyRateText),
+    minimumProjectBudgetText: normalizeText(rateCard.minimumProjectBudgetText),
+    fixedProjectMinimumText: normalizeText(rateCard.fixedProjectMinimumText)
+  };
+}
+
+function normalizeText(value) {
+  return String(value || "").trim();
+}
+
+function normalizeStringList(value) {
+  if (Array.isArray(value)) return value.map((item) => normalizeText(item)).filter(Boolean);
+  return String(value || "")
+    .split(/\n|,/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 async function getStorageUsage() {
@@ -958,6 +1156,35 @@ function captureVisibleDom(maxChars) {
   };
 }
 
+async function readPersonalContext() {
+  const data = await chrome.storage.local.get([
+    STORAGE_KEYS.myProfile,
+    STORAGE_KEYS.portfolioCases
+  ]);
+  const myProfile = data[STORAGE_KEYS.myProfile]?.archivedAt ? null : data[STORAGE_KEYS.myProfile] || null;
+  const portfolioCases = (Array.isArray(data[STORAGE_KEYS.portfolioCases]) ? data[STORAGE_KEYS.portfolioCases] : [])
+    .filter((item) => !item.archivedAt)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
+  return { myProfile, portfolioCases };
+}
+
+function buildPersonalContextSignature(context = {}) {
+  return JSON.stringify({
+    myProfile: context.myProfile ? {
+      id: context.myProfile.id,
+      version: context.myProfile.version,
+      updatedAt: context.myProfile.updatedAt,
+      archivedAt: context.myProfile.archivedAt || null
+    } : null,
+    portfolioCases: (context.portfolioCases || []).map((item) => ({
+      id: item.id,
+      version: item.version,
+      updatedAt: item.updatedAt,
+      archivedAt: item.archivedAt || null
+    }))
+  });
+}
+
 async function scoreOpportunity(opportunityId) {
   const settings = await getSettings();
   if (!settings.apiKey) throw new Error("OpenAI API key is missing. Set it in Options first.");
@@ -971,6 +1198,7 @@ async function scoreOpportunity(opportunityId) {
     if (!detail.snapshots.length) throw new Error("No snapshots captured for this opportunity");
     const currentProfile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
     const currentProfileMatchesSnapshots = currentProfile && arraysEqual(currentProfile.inputSnapshotIds, opportunity.snapshotIds);
+    const personalContext = await readPersonalContext();
 
     return {
       detail,
@@ -980,6 +1208,8 @@ async function scoreOpportunity(opportunityId) {
       currentProfileId: opportunity.currentProfileId || null,
       currentProfileUpdatedAt: currentProfileMatchesSnapshots ? currentProfile.updatedAt : null,
       profileCount: store.opportunityProfiles.filter((item) => item.opportunityId === opportunityId).length,
+      personalContext,
+      personalContextSignature: buildPersonalContextSignature(personalContext),
       currentScoreResultId: opportunity.currentScoreResultId || null,
       status: opportunity.status
     };
@@ -1001,7 +1231,7 @@ async function scoreOpportunity(opportunityId) {
     shouldCreateProfile = true;
   }
   const effectiveProfile = profileFieldsToLegacyRawProfile(profileRecord);
-  const rawScore = await scoreOpportunityProfile(scoringInput.detail, effectiveProfile, settings);
+  const rawScore = await scoreOpportunityProfile(scoringInput.detail, effectiveProfile, settings, scoringInput.personalContext);
 
   return withStorageLock(async () => {
     const store = await readStore();
@@ -1009,12 +1239,14 @@ async function scoreOpportunity(opportunityId) {
     if (index === -1) throw new Error("Opportunity not found");
     const opportunity = store.opportunities[index];
     const currentProfile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
+    const currentPersonalContext = await readPersonalContext();
     if (
       opportunity.status === OPPORTUNITY_STATUS.archived ||
       opportunity.status !== scoringInput.status ||
       (opportunity.currentScoreResultId || null) !== scoringInput.currentScoreResultId ||
       (opportunity.currentProfileId || null) !== scoringInput.currentProfileId ||
       (scoringInput.currentProfileUpdatedAt && currentProfile?.updatedAt !== scoringInput.currentProfileUpdatedAt) ||
+      buildPersonalContextSignature(currentPersonalContext) !== scoringInput.personalContextSignature ||
       !arraysEqual(opportunity.snapshotIds, scoringInput.snapshotIds) ||
       (opportunity.currentNotesRevisionId || null) !== scoringInput.notesRevisionId
     ) {
@@ -1035,6 +1267,7 @@ async function scoreOpportunity(opportunityId) {
       inputProfileVersion: inputProfile.version,
       notesRevisionId: scoringInput.notesRevisionId,
       profileReviewed: Boolean(inputProfile.reviewedAt),
+      personalContext: scoringInput.personalContext,
       createdAt
     });
 
@@ -1132,7 +1365,7 @@ async function extractOpportunityProfile(opportunity, settings) {
   });
 }
 
-async function scoreOpportunityProfile(opportunity, profile, settings) {
+async function scoreOpportunityProfile(opportunity, profile, settings, personalContext = {}) {
   const schema = {
     type: "object",
     additionalProperties: false,
@@ -1185,6 +1418,7 @@ async function scoreOpportunityProfile(opportunity, profile, settings) {
   const prompt = [
     "Score this Upwork opportunity using the exact 100-point sheet below.",
     "Use only the extracted profile and snapshot evidence. Do not invent missing facts.",
+    "Use saved user profile and portfolio only when explicitly provided below; never infer personal experience that is not saved there.",
     "If evidence is weak, lower confidence and list missing fields. Scores may still be estimated from available evidence, but the reasoning must identify the assumption.",
     "Language: Chinese, with concise English labels where useful.",
     "",
@@ -1208,6 +1442,12 @@ async function scoreOpportunityProfile(opportunity, profile, settings) {
     `User notes: ${opportunity.notes || ""}`,
     "Extracted profile JSON:",
     JSON.stringify(profile, null, 2),
+    "",
+    "Saved user profile JSON:",
+    JSON.stringify(personalContext.myProfile || null, null, 2),
+    "",
+    "Saved portfolio cases JSON:",
+    JSON.stringify(personalContext.portfolioCases || [], null, 2),
     "",
     "Snapshot corpus:",
     buildSnapshotCorpus(opportunity, 45000)
@@ -1248,8 +1488,10 @@ function createProfileRecord({ id, opportunityId, rawProfile, model, inputSnapsh
   };
 }
 
-function createScoreRecord({ id, opportunityId, rawScore, model, inputSnapshotIds, inputProfileId, inputProfileVersion, notesRevisionId, profileReviewed, createdAt }) {
+function createScoreRecord({ id, opportunityId, rawScore, model, inputSnapshotIds, inputProfileId, inputProfileVersion, notesRevisionId, profileReviewed, personalContext, createdAt }) {
   const normalized = normalizeRawScore(rawScore);
+  const myProfile = personalContext?.myProfile || null;
+  const portfolioCases = personalContext?.portfolioCases || [];
   return {
     id,
     opportunityId,
@@ -1263,6 +1505,9 @@ function createScoreRecord({ id, opportunityId, rawScore, model, inputSnapshotId
     inputProfileVersion,
     notesRevisionId,
     profileReviewed,
+    inputMyProfileId: myProfile?.id || null,
+    inputMyProfileVersion: myProfile?.version || null,
+    inputPortfolioCaseRefs: portfolioCases.map((item) => ({ id: item.id, version: item.version })),
     totalScore: normalized.total_score,
     decision: normalized.decision,
     decisionSummary: normalized.decision_summary,
@@ -1340,6 +1585,9 @@ function toLegacyScoreResult(score, { scoreStale = false } = {}) {
     scoreVersion: score.scoreVersion,
     inputSnapshotIds: score.inputSnapshotIds,
     inputProfileVersion: score.inputProfileVersion,
+    inputMyProfileId: score.inputMyProfileId || null,
+    inputMyProfileVersion: score.inputMyProfileVersion || null,
+    inputPortfolioCaseRefs: score.inputPortfolioCaseRefs || [],
     profileReviewed: score.profileReviewed,
     total_score: score.totalScore,
     decision: score.decision,
@@ -1593,11 +1841,15 @@ function validateImportData(importPayload) {
   const profiles = requireArray(data[STORAGE_KEYS.opportunityProfiles], STORAGE_KEYS.opportunityProfiles);
   const scores = requireArray(data[STORAGE_KEYS.scoreResults], STORAGE_KEYS.scoreResults);
   const notes = requireArray(data[STORAGE_KEYS.noteRevisions], STORAGE_KEYS.noteRevisions);
+  const myProfile = data[STORAGE_KEYS.myProfile] ?? null;
+  const portfolioCases = requireArray(data[STORAGE_KEYS.portfolioCases] || [], STORAGE_KEYS.portfolioCases);
   validateEntityShape(opportunities, IMPORT_ENTITY_SCHEMAS.opportunity);
   validateEntityShape(snapshots, IMPORT_ENTITY_SCHEMAS.snapshot);
   validateEntityShape(profiles, IMPORT_ENTITY_SCHEMAS.opportunityProfile);
   validateEntityShape(scores, IMPORT_ENTITY_SCHEMAS.scoreResult);
   validateEntityShape(notes, IMPORT_ENTITY_SCHEMAS.noteRevision);
+  validateOptionalEntityShape(myProfile, IMPORT_ENTITY_SCHEMAS.myProfile);
+  validateEntityShape(portfolioCases, IMPORT_ENTITY_SCHEMAS.portfolioCase);
   validateReferences({ opportunities, snapshots, profiles, scores, notes });
 
   return {
@@ -1607,7 +1859,9 @@ function validateImportData(importPayload) {
       snapshots: snapshots.length,
       opportunityProfiles: profiles.length,
       scoreResults: scores.length,
-      noteRevisions: notes.length
+      noteRevisions: notes.length,
+      myProfile: myProfile ? 1 : 0,
+      portfolioCases: portfolioCases.length
     }
   };
 }
@@ -1631,12 +1885,22 @@ const IMPORT_ENTITY_SCHEMAS = Object.freeze({
   scoreResult: {
     name: "ScoreResult",
     required: ["id", "opportunityId", "schemaVersion", "createdAt", "promptVersion", "scoreVersion", "inputSnapshotIds", "totalScore", "decision", "dimensions"],
-    allowed: ["id", "opportunityId", "schemaVersion", "createdAt", "model", "promptVersion", "scoreVersion", "inputSnapshotIds", "inputProfileId", "inputProfileVersion", "notesRevisionId", "profileReviewed", "totalScore", "decision", "decisionSummary", "timingPriority", "dimensions", "hardRedFlags", "risks", "missingInfoChecklist", "recommendedBidStrategy", "proposalAngle", "confidence", "archivedAt", "rawResult"]
+    allowed: ["id", "opportunityId", "schemaVersion", "createdAt", "model", "promptVersion", "scoreVersion", "inputSnapshotIds", "inputProfileId", "inputProfileVersion", "notesRevisionId", "profileReviewed", "inputMyProfileId", "inputMyProfileVersion", "inputPortfolioCaseRefs", "totalScore", "decision", "decisionSummary", "timingPriority", "dimensions", "hardRedFlags", "risks", "missingInfoChecklist", "recommendedBidStrategy", "proposalAngle", "confidence", "archivedAt", "rawResult"]
   },
   noteRevision: {
     name: "OpportunityNoteRevision",
     required: ["id", "opportunityId", "schemaVersion", "text", "createdAt", "createdBy"],
     allowed: ["id", "opportunityId", "schemaVersion", "text", "createdAt", "createdBy"]
+  },
+  myProfile: {
+    name: "MyProfile",
+    required: ["id", "schemaVersion", "version", "createdAt", "updatedAt", "displayName", "title", "summary", "skillTags", "serviceCategories", "strengths", "preferredProjects", "rejectRules", "rateCard", "availability", "proposalPreferences", "languagePreferences"],
+    allowed: ["id", "schemaVersion", "version", "createdAt", "updatedAt", "displayName", "title", "summary", "skillTags", "serviceCategories", "strengths", "preferredProjects", "rejectRules", "rateCard", "availability", "proposalPreferences", "languagePreferences", "archivedAt"]
+  },
+  portfolioCase: {
+    name: "PortfolioCase",
+    required: ["id", "schemaVersion", "version", "createdAt", "updatedAt", "title", "summary", "skillTags", "outcome", "proofPoints", "links", "applicableKeywords", "sourceRefs"],
+    allowed: ["id", "schemaVersion", "version", "createdAt", "updatedAt", "title", "summary", "skillTags", "outcome", "proofPoints", "links", "applicableKeywords", "sourceRefs", "archivedAt"]
   }
 });
 
@@ -1677,6 +1941,11 @@ function validateEntityShape(records, schema) {
     }
     if (record.schemaVersion !== SCHEMA_VERSION) throw new Error(`${schema.name} ${record.id || "(missing id)"} has unsupported schemaVersion`);
   }
+}
+
+function validateOptionalEntityShape(record, schema) {
+  if (record === null || record === undefined) return;
+  validateEntityShape([record], schema);
 }
 
 async function importData(importPayload) {
@@ -1761,6 +2030,7 @@ function countExportEntities(data) {
     opportunityProfiles: (data[STORAGE_KEYS.opportunityProfiles] || []).length,
     scoreResults: (data[STORAGE_KEYS.scoreResults] || []).length,
     noteRevisions: (data[STORAGE_KEYS.noteRevisions] || []).length,
+    myProfile: data[STORAGE_KEYS.myProfile] ? 1 : 0,
     portfolioCases: (data[STORAGE_KEYS.portfolioCases] || []).length,
     outcomeEvents: (data[STORAGE_KEYS.outcomeEvents] || []).length,
     clientRecords: (data[STORAGE_KEYS.clientRecords] || []).length,

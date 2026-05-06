@@ -97,6 +97,11 @@ async function smokeOptionsPage(extensionId) {
     "#settingsForm",
     "#compactSnapshotsButton",
     "#redactSnapshotsButton",
+    "#saveProfileButton",
+    "#clearProfileButton",
+    "#portfolioSelect",
+    "#savePortfolioButton",
+    "#archivePortfolioButton",
     "#previewImportButton",
     "#commitImportButton"
   ]), true);
@@ -107,6 +112,21 @@ async function smokeOptionsPage(extensionId) {
     })
   `));
   assert.equal(settingsResponse.ok, true);
+
+  const myProfileResponse = JSON.parse(await evaluate(page.sessionId, `
+    new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "myProfile:get" }, (response) => resolve(JSON.stringify(response)));
+    })
+  `));
+  assert.equal(myProfileResponse.ok, true);
+
+  const portfolioResponse = JSON.parse(await evaluate(page.sessionId, `
+    new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "portfolio:list" }, (response) => resolve(JSON.stringify(response)));
+    })
+  `));
+  assert.equal(portfolioResponse.ok, true);
+  assert.equal(Array.isArray(portfolioResponse.portfolioCases), true);
 
   const retentionResponse = JSON.parse(await evaluate(page.sessionId, `
     new Promise((resolve) => {

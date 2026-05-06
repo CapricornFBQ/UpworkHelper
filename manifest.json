@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Upwork Opportunity Scorer",
   "description": "Manually capture Upwork pages into opportunity sessions and score them with OpenAI.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "action": {
     "default_title": "Upwork Scorer",
     "default_popup": "src/popup/popup.html"

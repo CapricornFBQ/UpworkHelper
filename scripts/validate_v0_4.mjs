@@ -39,7 +39,7 @@ for (const file of jsFiles) {
 assert.equal(SCHEMA_VERSION, 1);
 assert.equal(DEFAULT_SETTINGS.captureMode, "strict_upwork");
 assert.equal(PLATFORM_HOSTS.upwork, "www.upwork.com");
-assert.equal(PLAN_VERSION, "0.3.0");
+assert.equal(PLAN_VERSION, "0.4.0");
 assert.equal(OPPORTUNITY_STATUS.draft, "draft");
 assert.equal(OPPORTUNITY_STATUS.captured, "captured");
 assert.equal(SNAPSHOT_RETENTION_STATE.deletedReferenceOnly, "deleted_reference_only");
@@ -188,6 +188,14 @@ const unsupportedFutureEntityPreview = await sendBackgroundMessage({ type: "data
 assert.equal(unsupportedFutureEntityPreview.ok, false);
 assert.match(unsupportedFutureEntityPreview.error, /import is not supported yet/);
 
+const personalImport = structuredClone(validImportPayload);
+personalImport.data[STORAGE_KEYS.myProfile] = makeMyProfile("my_profile_import");
+personalImport.data[STORAGE_KEYS.portfolioCases] = [makePortfolioCase("case_import")];
+const personalImportPreview = await sendBackgroundMessage({ type: "data:importPreview", data: personalImport });
+assert.equal(personalImportPreview.ok, true);
+assert.equal(personalImportPreview.preview.entityCounts.myProfile, 1);
+assert.equal(personalImportPreview.preview.entityCounts.portfolioCases, 1);
+
 sendBackgroundMessage.storageData[STORAGE_KEYS.settings] = { ...DEFAULT_SETTINGS, apiKey: "local-secret" };
 sendBackgroundMessage.storageData[STORAGE_KEYS.opportunities] = [{
   id: "opp_stale",
@@ -218,10 +226,12 @@ await runCaptureTests();
 await runSnapshotRetentionTests();
 await runArchiveRestoreDeleteTests();
 await runNotesStaleTests();
+await runMyProfilePortfolioTests();
 await runProfileReviewTests();
+await runPersonalContextScoreTests();
 await runScoreTests();
 
-console.log("v0.3 validation passed");
+console.log("v0.4 validation passed");
 
 async function runSettingsExportBackupTests() {
   const harness = await loadBackgroundForValidation({
@@ -511,6 +521,93 @@ async function runNotesStaleTests() {
   assert.equal(detail.opportunity.scoreResult.scoreStale, true);
 }
 
+async function runMyProfilePortfolioTests() {
+  const harness = await loadBackgroundForValidation();
+
+  const emptyProfile = await harness({ type: "myProfile:get" });
+  assert.equal(emptyProfile.ok, true);
+  assert.equal(emptyProfile.profile, null);
+
+  const savedProfile = await harness({
+    type: "myProfile:save",
+    profile: {
+      displayName: " Fanbingqi ",
+      title: "Chrome extension engineer",
+      summary: "Builds browser extensions.",
+      skillTags: "Chrome MV3\nJavaScript",
+      serviceCategories: ["Browser extensions"],
+      strengths: ["Storage reliability"],
+      preferredProjects: ["Extension tools"],
+      rejectRules: ["Free test tasks"],
+      rateCard: { currency: "USD", hourlyRateText: "$80/hr", minimumProjectBudgetText: "$500" },
+      availability: "Part-time",
+      proposalPreferences: ["Lead with proof"],
+      languagePreferences: ["English"]
+    }
+  });
+  assert.equal(savedProfile.ok, true);
+  assert.equal(savedProfile.profile.version, 1);
+  assert.equal(savedProfile.profile.displayName, "Fanbingqi");
+  assert.deepEqual(savedProfile.profile.skillTags, ["Chrome MV3", "JavaScript"]);
+
+  const updatedProfile = await harness({
+    type: "myProfile:save",
+    profile: { summary: "Builds reliable browser extensions." }
+  });
+  assert.equal(updatedProfile.profile.version, 2);
+  assert.equal(updatedProfile.profile.skillTags.length, 2);
+  assert.match(updatedProfile.profile.summary, /reliable/);
+
+  const createdCase = await harness({
+    type: "portfolio:create",
+    portfolioCase: {
+      title: "MV3 score helper",
+      summary: "Built an MV3 helper.",
+      skillTags: ["Chrome MV3"],
+      outcome: "Shipped stable extension.",
+      proofPoints: ["Storage migration"],
+      links: ["https://example.com/mv3"],
+      applicableKeywords: ["extension", "score"],
+      sourceRefs: []
+    }
+  });
+  assert.equal(createdCase.ok, true);
+  assert.equal(createdCase.portfolioCase.version, 1);
+
+  const listed = await harness({ type: "portfolio:list" });
+  assert.equal(listed.portfolioCases.length, 1);
+
+  const updatedCase = await harness({
+    type: "portfolio:update",
+    id: createdCase.portfolioCase.id,
+    portfolioCase: { outcome: "Reduced manual review time." }
+  });
+  assert.equal(updatedCase.portfolioCase.version, 2);
+  assert.equal(updatedCase.portfolioCase.title, "MV3 score helper");
+  assert.match(updatedCase.portfolioCase.outcome, /Reduced/);
+
+  const exported = await harness({ type: "data:export" });
+  assert.equal(exported.exportData.manifest.entityCounts.myProfile, 1);
+  assert.equal(exported.exportData.manifest.entityCounts.portfolioCases, 1);
+
+  const archived = await harness({ type: "portfolio:archive", id: createdCase.portfolioCase.id });
+  assert.equal(archived.portfolioCase.archivedAt !== null, true);
+  const activeAfterArchive = await harness({ type: "portfolio:list" });
+  assert.equal(activeAfterArchive.portfolioCases.length, 0);
+
+  const secondCase = await harness({ type: "portfolio:create", portfolioCase: makePortfolioCase("case_clear") });
+  assert.equal(secondCase.ok, true);
+  const clearCases = await harness({ type: "portfolio:clear" });
+  assert.equal(clearCases.archivedCount, 1);
+  const activeAfterClear = await harness({ type: "portfolio:list" });
+  assert.equal(activeAfterClear.portfolioCases.length, 0);
+
+  const clearedProfile = await harness({ type: "myProfile:clear" });
+  assert.equal(clearedProfile.ok, true);
+  const profileAfterClear = await harness({ type: "myProfile:get" });
+  assert.equal(profileAfterClear.profile, null);
+}
+
 async function runProfileReviewTests() {
   const harness = await loadBackgroundForValidation({
     storageData: makeScoreStorageData("opp_profile"),
@@ -564,6 +661,51 @@ async function runProfileReviewTests() {
   assert.equal(cleared.opportunity.profile.profileReviewed, false);
   assert.equal(cleared.opportunity.profile.conflicts.length, 0);
   assert.equal(cleared.opportunity.effectiveProfile.jobTitle, "Chrome extension engineer");
+}
+
+async function runPersonalContextScoreTests() {
+  const harness = await loadBackgroundForValidation({
+    storageData: {
+      ...makeScoreStorageData("opp_personal"),
+      [STORAGE_KEYS.myProfile]: makeMyProfile("my_profile_score", { version: 3 }),
+      [STORAGE_KEYS.portfolioCases]: [
+        makePortfolioCase("case_score", { version: 2 }),
+        makePortfolioCase("case_archived", { title: "Archived case", archivedAt: "2026-05-06T00:00:00.000Z" })
+      ]
+    },
+    fetchResponses: [
+      openAIText(fakeProfile),
+      ({ init }) => {
+        const prompt = JSON.parse(init.body).input[0].content[0].text;
+        assert.match(prompt, /Fanbingqi/);
+        assert.match(prompt, /MV3 scoring extension/);
+        assert.doesNotMatch(prompt, /Archived case/);
+        return openAIText(fakeScore);
+      },
+      ({ init }) => {
+        const prompt = JSON.parse(init.body).input[0].content[0].text;
+        assert.doesNotMatch(prompt, /Fanbingqi/);
+        assert.doesNotMatch(prompt, /MV3 scoring extension/);
+        return openAIText(fakeScore);
+      }
+    ]
+  });
+
+  const scored = await harness({ type: "score:opportunity", opportunityId: "opp_personal" });
+  assert.equal(scored.ok, true);
+  const firstScore = harness.storageData[STORAGE_KEYS.scoreResults][0];
+  assert.equal(firstScore.inputMyProfileId, "my_profile_score");
+  assert.equal(firstScore.inputMyProfileVersion, 3);
+  assert.deepEqual(firstScore.inputPortfolioCaseRefs, [{ id: "case_score", version: 2 }]);
+
+  await harness({ type: "myProfile:clear" });
+  await harness({ type: "portfolio:clear" });
+  const scoredAfterClear = await harness({ type: "score:opportunity", opportunityId: "opp_personal" });
+  assert.equal(scoredAfterClear.ok, true);
+  const secondScore = harness.storageData[STORAGE_KEYS.scoreResults][1];
+  assert.equal(secondScore.inputMyProfileId, null);
+  assert.equal(secondScore.inputMyProfileVersion, null);
+  assert.deepEqual(secondScore.inputPortfolioCaseRefs, []);
 }
 
 async function runScoreTests() {
@@ -873,6 +1015,57 @@ function makeNote(id, opportunityId, text) {
     text,
     createdAt: "2026-05-06T00:00:00.000Z",
     createdBy: "user"
+  };
+}
+
+function makeMyProfile(id = "my_profile", overrides = {}) {
+  const now = "2026-05-06T00:00:00.000Z";
+  return {
+    id,
+    schemaVersion: SCHEMA_VERSION,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+    displayName: "Fanbingqi",
+    title: "Chrome extension engineer",
+    summary: "Builds reliable browser extensions and automation tooling.",
+    skillTags: ["Chrome MV3", "JavaScript"],
+    serviceCategories: ["Browser extensions"],
+    strengths: ["Storage migration", "Extension UX"],
+    preferredProjects: ["MV3 extensions"],
+    rejectRules: ["Free test tasks", "Budget below $500"],
+    rateCard: {
+      currency: "USD",
+      hourlyRateText: "$80/hr",
+      minimumProjectBudgetText: "$500",
+      fixedProjectMinimumText: "$1000"
+    },
+    availability: "Part-time",
+    proposalPreferences: ["Lead with proof"],
+    languagePreferences: ["English"],
+    archivedAt: null,
+    ...overrides
+  };
+}
+
+function makePortfolioCase(id = "case_extension", overrides = {}) {
+  const now = "2026-05-06T00:00:00.000Z";
+  return {
+    id,
+    schemaVersion: SCHEMA_VERSION,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+    title: "MV3 scoring extension",
+    summary: "Built a Chrome MV3 extension with local storage and scoring flows.",
+    skillTags: ["Chrome MV3", "OpenAI"],
+    outcome: "Delivered a stable extension workflow.",
+    proofPoints: ["Implemented MV3 service worker", "Added regression tests"],
+    links: ["https://example.com/case"],
+    applicableKeywords: ["extension", "mv3", "scoring"],
+    sourceRefs: [],
+    archivedAt: null,
+    ...overrides
   };
 }
 

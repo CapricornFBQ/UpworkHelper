@@ -55,6 +55,157 @@
         </div>
       </form>
 
+      <section class="settings-form">
+        <div>
+          <h2>My Profile</h2>
+          <p class="muted">Saved profile content is available to scoring and future proposals.</p>
+        </div>
+
+        <div class="grid-2">
+          <label>
+            Display name
+            <input id="profileDisplayName" type="text" autocomplete="off">
+          </label>
+          <label>
+            Title
+            <input id="profileTitle" type="text" autocomplete="off">
+          </label>
+        </div>
+
+        <label>
+          Summary
+          <textarea id="profileSummary" rows="4" placeholder="Short positioning, service focus, and experience."></textarea>
+        </label>
+
+        <div class="grid-2">
+          <label>
+            Skill tags
+            <textarea id="profileSkillTags" rows="4" placeholder="Chrome MV3&#10;JavaScript"></textarea>
+          </label>
+          <label>
+            Service categories
+            <textarea id="profileServiceCategories" rows="4" placeholder="Browser extensions&#10;Automation tooling"></textarea>
+          </label>
+        </div>
+
+        <div class="grid-2">
+          <label>
+            Strengths
+            <textarea id="profileStrengths" rows="4"></textarea>
+          </label>
+          <label>
+            Preferred projects
+            <textarea id="profilePreferredProjects" rows="4"></textarea>
+          </label>
+        </div>
+
+        <label>
+          Reject rules
+          <textarea id="profileRejectRules" rows="4" placeholder="Free test tasks&#10;Budget below minimum"></textarea>
+        </label>
+
+        <div class="grid-2">
+          <label>
+            Currency
+            <input id="profileRateCurrency" type="text" value="USD">
+          </label>
+          <label>
+            Hourly rate
+            <input id="profileHourlyRate" type="text" placeholder="$80/hr">
+          </label>
+        </div>
+
+        <div class="grid-2">
+          <label>
+            Minimum project budget
+            <input id="profileMinimumBudget" type="text" placeholder="$500">
+          </label>
+          <label>
+            Fixed project minimum
+            <input id="profileFixedMinimum" type="text" placeholder="$1000">
+          </label>
+        </div>
+
+        <div class="grid-2">
+          <label>
+            Availability
+            <textarea id="profileAvailability" rows="3"></textarea>
+          </label>
+          <label>
+            Language preferences
+            <textarea id="profileLanguagePreferences" rows="3"></textarea>
+          </label>
+        </div>
+
+        <label>
+          Proposal preferences
+          <textarea id="profileProposalPreferences" rows="4"></textarea>
+        </label>
+
+        <div class="button-row">
+          <button id="saveProfileButton" class="primary" type="button">Save profile</button>
+          <button id="clearProfileButton" class="danger" type="button">Clear profile</button>
+          <span id="profileStatus" class="muted"></span>
+        </div>
+      </section>
+
+      <section class="settings-form">
+        <div>
+          <h2>Portfolio Cases</h2>
+          <p class="muted">Only active cases are available to scoring and future proposals.</p>
+        </div>
+
+        <label>
+          Saved cases
+          <select id="portfolioSelect"></select>
+        </label>
+
+        <div class="grid-2">
+          <label>
+            Case title
+            <input id="portfolioTitle" type="text">
+          </label>
+          <label>
+            Skill tags
+            <textarea id="portfolioSkillTags" rows="3"></textarea>
+          </label>
+        </div>
+
+        <label>
+          Summary
+          <textarea id="portfolioSummary" rows="4"></textarea>
+        </label>
+
+        <label>
+          Outcome
+          <textarea id="portfolioOutcome" rows="3"></textarea>
+        </label>
+
+        <div class="grid-2">
+          <label>
+            Proof points
+            <textarea id="portfolioProofPoints" rows="4"></textarea>
+          </label>
+          <label>
+            Applicable keywords
+            <textarea id="portfolioApplicableKeywords" rows="4"></textarea>
+          </label>
+        </div>
+
+        <label>
+          Links
+          <textarea id="portfolioLinks" rows="3"></textarea>
+        </label>
+
+        <div class="button-row">
+          <button id="newPortfolioButton" type="button">New case</button>
+          <button id="savePortfolioButton" class="primary" type="button">Save case</button>
+          <button id="archivePortfolioButton" class="danger" type="button">Archive case</button>
+          <button id="clearPortfolioButton" class="danger" type="button">Archive all cases</button>
+          <span id="portfolioStatus" class="muted"></span>
+        </div>
+      </section>
+
       <section class="settings-form data-panel">
         <div>
           <h2>Storage and Data</h2>
@@ -77,7 +228,7 @@
 
         <label>
           Import JSON
-          <textarea id="importInput" rows="7" placeholder="Paste a v0.2 export JSON here for preview before import."></textarea>
+          <textarea id="importInput" rows="7" placeholder="Paste a v0.4 export JSON here for preview before import."></textarea>
         </label>
 
         <div class="button-row">
