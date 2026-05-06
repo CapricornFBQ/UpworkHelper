@@ -10,6 +10,10 @@ Local Chrome MV3 extension for manually capturing Upwork pages into opportunity 
 - OpenAI API key is stored in Chrome local extension storage and only used by the background service worker.
 - Captured page text and analysis history stay in local Chrome extension storage.
 
+## Planning
+
+- Long-term implementation plan: `docs/LONG_TERM_PLAN.md`
+
 ## Load in Chrome
 
 1. Open `chrome://extensions`.
