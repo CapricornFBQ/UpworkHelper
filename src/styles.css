@@ -99,6 +99,10 @@ textarea {
   resize: vertical;
 }
 
+textarea[readonly] {
+  background: #f9fafb;
+}
+
 label {
   display: grid;
   gap: 6px;
@@ -168,6 +172,10 @@ label {
   display: grid;
   gap: 14px;
   margin: 0;
+}
+
+.settings-form + .settings-form {
+  margin-top: 14px;
 }
 
 .grid-2 {

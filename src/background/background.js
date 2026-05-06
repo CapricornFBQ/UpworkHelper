@@ -7,6 +7,7 @@ import {
   SNAPSHOT_RETENTION_STATE,
   STORAGE_KEYS
 } from "../shared/schema.js";
+import { mapRawProfileFields, normalizeDimensions, normalizeRawScore } from "../shared/adapters.js";
 
 const MAX_SNAPSHOT_CHARS = 70000;
 const MAX_SCORE_INPUT_CHARS = 110000;
@@ -853,70 +854,6 @@ function createScoreRecord({ id, opportunityId, rawScore, model, inputSnapshotId
   };
 }
 
-function mapRawProfileFields(rawProfile = {}) {
-  const fieldMap = {
-    title: "jobTitle",
-    job_description_summary: "descriptionSummary",
-    required_skills: "requiredSkills",
-    budget: "budgetText",
-    hourly_or_fixed: "pricingType",
-    proposal_count: "proposalCountText",
-    connects_cost: "connectsCostText",
-    posted_time: "postedTimeText",
-    interviews: "interviewsText",
-    invites_sent: "invitesSentText",
-    hires: "hiresText",
-    client_payment_verified: "clientPaymentVerifiedText",
-    client_rating: "clientRatingText",
-    client_total_spend: "clientTotalSpendText",
-    client_hire_rate: "clientHireRateText",
-    client_avg_hourly_paid: "clientAvgHourlyPaidText",
-    client_type: "clientType",
-    test_task: "testTaskSignal",
-    long_term_signal: "longTermSignal"
-  };
-  const fields = {};
-  for (const [rawKey, fieldKey] of Object.entries(fieldMap)) {
-    const value = rawProfile?.[rawKey] ?? null;
-    if (value === null || value === undefined || value === "") continue;
-    fields[fieldKey] = {
-      value,
-      valueKind: Array.isArray(value) ? "array" : "text",
-      effectiveSource: "ai_extracted",
-      sources: [{
-        source: "ai_extracted",
-        value,
-        confidence: null,
-        evidenceRefs: [],
-        snapshotId: null,
-        selectorId: null,
-        createdAt: new Date().toISOString()
-      }],
-      confidence: null,
-      evidenceRefs: [],
-      correctedAt: null,
-      correctedBy: null
-    };
-  }
-  return fields;
-}
-
-function normalizeRawScore(rawScore = {}) {
-  return {
-    total_score: clampNumber(rawScore.total_score, 0, 100),
-    decision: SCORE_DECISIONS.includes(rawScore.decision) ? rawScore.decision : "skip",
-    decision_summary: String(rawScore.decision_summary || ""),
-    timing_priority: String(rawScore.timing_priority || ""),
-    dimensions: normalizeDimensions(rawScore.dimensions || []),
-    hard_red_flags: Array.isArray(rawScore.hard_red_flags) ? rawScore.hard_red_flags : [],
-    risks: Array.isArray(rawScore.risks) ? rawScore.risks : [],
-    missing_info_checklist: Array.isArray(rawScore.missing_info_checklist) ? rawScore.missing_info_checklist : [],
-    recommended_bid_strategy: String(rawScore.recommended_bid_strategy || ""),
-    proposal_angle: String(rawScore.proposal_angle || ""),
-    confidence: clampNumber(rawScore.confidence, 0, 1)
-  };
-}
-
 function hydrateOpportunity(opportunity, store) {
   const snapshots = opportunity.snapshotIds
     .map((id) => store.snapshots.find((item) => item.id === id))
@@ -1055,14 +992,6 @@ function extractResponseText(payload) {
     }
   }
   return parts.join("\n").trim();
-}
-
-function normalizeDimensions(dimensions) {
-  return dimensions.map((dimension) => ({
-    ...dimension,
-    score: clampNumber(dimension.score, 0, dimension.max_score || dimension.maxScore || 100),
-    confidence: clampNumber(dimension.confidence, 0, 1)
-  }));
 }
 
 function inferPageType(url, text) {
@@ -1214,12 +1143,18 @@ function validateImportData(importPayload) {
   const data = importPayload?.data;
   if (!manifest || !data) throw new Error("Import file must contain manifest and data");
   if (manifest.schemaVersion !== SCHEMA_VERSION) throw new Error(`Unsupported schemaVersion: ${manifest.schemaVersion}`);
+  validateKnownTopLevelKeys(data);
 
   const opportunities = requireArray(data[STORAGE_KEYS.opportunities], STORAGE_KEYS.opportunities);
   const snapshots = requireArray(data[STORAGE_KEYS.snapshots], STORAGE_KEYS.snapshots);
   const profiles = requireArray(data[STORAGE_KEYS.opportunityProfiles], STORAGE_KEYS.opportunityProfiles);
   const scores = requireArray(data[STORAGE_KEYS.scoreResults], STORAGE_KEYS.scoreResults);
   const notes = requireArray(data[STORAGE_KEYS.noteRevisions], STORAGE_KEYS.noteRevisions);
+  validateEntityShape(opportunities, IMPORT_ENTITY_SCHEMAS.opportunity);
+  validateEntityShape(snapshots, IMPORT_ENTITY_SCHEMAS.snapshot);
+  validateEntityShape(profiles, IMPORT_ENTITY_SCHEMAS.opportunityProfile);
+  validateEntityShape(scores, IMPORT_ENTITY_SCHEMAS.scoreResult);
+  validateEntityShape(notes, IMPORT_ENTITY_SCHEMAS.noteRevision);
   validateReferences({ opportunities, snapshots, profiles, scores, notes });
 
   return {
@@ -1232,6 +1167,54 @@ function validateImportData(importPayload) {
       noteRevisions: notes.length
     }
   };
+}
+
+const IMPORT_ENTITY_SCHEMAS = Object.freeze({
+  opportunity: {
+    name: "Opportunity",
+    required: ["id", "schemaVersion", "createdAt", "updatedAt", "title", "mainUrl", "platform", "status", "snapshotIds"],
+    allowed: ["id", "schemaVersion", "createdAt", "updatedAt", "title", "mainUrl", "jobKey", "platform", "status", "clientRecordId", "snapshotIds", "currentProfileId", "currentScoreResultId", "currentProposalDraftId", "currentNotesRevisionId", "archivedAt"]
+  },
+  snapshot: {
+    name: "Snapshot",
+    required: ["id", "opportunityId", "schemaVersion", "createdAt", "capturedAt", "sourceUrl", "pageTitle", "pageType", "platform", "textHash", "retentionState"],
+    allowed: ["id", "opportunityId", "schemaVersion", "createdAt", "capturedAt", "sourceUrl", "pageTitle", "pageType", "platform", "text", "textHash", "domSummary", "stats", "retentionState"]
+  },
+  opportunityProfile: {
+    name: "OpportunityProfile",
+    required: ["id", "opportunityId", "schemaVersion", "version", "createdAt", "updatedAt", "promptVersion", "inputSnapshotIds", "fields", "missingFieldKeys", "conflicts"],
+    allowed: ["id", "opportunityId", "schemaVersion", "version", "createdAt", "updatedAt", "model", "promptVersion", "scoreVersion", "inputSnapshotIds", "fields", "missingFieldKeys", "conflicts", "reviewedAt", "reviewedBy", "rawProfile"]
+  },
+  scoreResult: {
+    name: "ScoreResult",
+    required: ["id", "opportunityId", "schemaVersion", "createdAt", "promptVersion", "scoreVersion", "inputSnapshotIds", "totalScore", "decision", "dimensions"],
+    allowed: ["id", "opportunityId", "schemaVersion", "createdAt", "model", "promptVersion", "scoreVersion", "inputSnapshotIds", "inputProfileId", "inputProfileVersion", "notesRevisionId", "profileReviewed", "totalScore", "decision", "decisionSummary", "timingPriority", "dimensions", "hardRedFlags", "risks", "missingInfoChecklist", "recommendedBidStrategy", "proposalAngle", "confidence", "archivedAt", "rawResult"]
+  },
+  noteRevision: {
+    name: "OpportunityNoteRevision",
+    required: ["id", "opportunityId", "schemaVersion", "text", "createdAt", "createdBy"],
+    allowed: ["id", "opportunityId", "schemaVersion", "text", "createdAt", "createdBy"]
+  }
+});
+
+function validateKnownTopLevelKeys(data) {
+  const allowedKeys = new Set(Object.values(STORAGE_KEYS));
+  for (const key of Object.keys(data)) {
+    if (!allowedKeys.has(key)) throw new Error(`Unknown top-level import key: ${key}`);
+  }
+}
+
+function validateEntityShape(records, schema) {
+  const allowed = new Set(schema.allowed);
+  for (const record of records) {
+    for (const field of schema.required) {
+      if (record[field] === undefined) throw new Error(`${schema.name} ${record.id || "(missing id)"} missing required field: ${field}`);
+    }
+    for (const field of Object.keys(record)) {
+      if (!allowed.has(field)) throw new Error(`${schema.name} ${record.id || "(missing id)"} has unknown field: ${field}`);
+    }
+    if (record.schemaVersion !== SCHEMA_VERSION) throw new Error(`${schema.name} ${record.id || "(missing id)"} has unsupported schemaVersion`);
+  }
 }
 
 async function importData(importPayload) {

@@ -54,6 +54,35 @@
           <span id="saveStatus" class="muted"></span>
         </div>
       </form>
+
+      <section class="settings-form data-panel">
+        <div>
+          <h2>Storage and Data</h2>
+          <p class="muted" id="storageUsage">Storage usage not loaded.</p>
+        </div>
+
+        <div class="button-row">
+          <button id="refreshUsageButton" type="button">Refresh usage</button>
+          <button id="createBackupButton" type="button">Create backup</button>
+          <button id="exportButton" type="button">Export JSON</button>
+        </div>
+
+        <label>
+          Export preview
+          <textarea id="exportOutput" rows="7" readonly placeholder="Exported JSON appears here. API key is excluded."></textarea>
+        </label>
+
+        <label>
+          Import JSON
+          <textarea id="importInput" rows="7" placeholder="Paste a v0.2 export JSON here for preview before import."></textarea>
+        </label>
+
+        <div class="button-row">
+          <button id="previewImportButton" type="button">Preview import</button>
+          <button id="commitImportButton" class="danger" type="button">Commit import</button>
+          <span id="dataStatus" class="muted"></span>
+        </div>
+      </section>
     </main>
 
     <script type="module" src="./options.js"></script>

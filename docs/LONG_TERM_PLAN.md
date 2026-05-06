@@ -175,7 +175,7 @@ AI 或 prompt 生成的长期结果还必须包含：
 必须补充：
 
 - `uosc_meta`：保存 `schemaVersion`、`migratedAt`、`lastBackupAt`。
-- Export JSON：导出 settings 以外的长期数据。
+- Export JSON：导出长期数据和去敏后的 settings；`settings.apiKey` 必须置空或省略，不能进入导出文件。
 - Import JSON：导入前校验 schema version。
 - Snapshot retention：支持清理原始全文，只保留 extracted fields、evidence、DOM summary。
 - Migration helper：任何新增 storage key 前先保证旧数据可读。
@@ -1258,6 +1258,24 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 11. Capture 严格校验 host 和 jobKey，避免非 Upwork 页面或不同 job 混入已有 Opportunity。
 12. 保护 API Key storage；新增 content script 前必须验证 content script 不能读取 `apiKey`。
 
+### 9.8 v0.2 当前实施状态
+
+截至当前代码，v0.2 数据基础已落地：
+
+1. `src/shared/schema.js` 统一导出 schema、storage key、状态枚举、prompt / score version 常量。
+2. `src/shared/adapters.js` 统一承接 OpenAI snake_case response 到 canonical storage 字段的映射和分数 clamp。
+3. background 已拆出 `uosc_meta`、`uosc_snapshots`、`uosc_opportunity_profiles`、`uosc_score_results`、`uosc_note_revisions`，并保留旧数据迁移兼容。
+4. Options 已提供 storage usage、backup、export、import preview、import commit；导出结果不包含 API Key。
+5. `scripts/validate_v0_2.mjs` 已覆盖 JS syntax、风险静态扫描、adapter fake response、import validation 的有效/失败路径。
+6. MCP / Playwright 已用 mocked `chrome.runtime` 验证 Options 数据 UI 的导出、预览导入、确认导入流程。
+
+仍未进入 v0.2 的内容：
+
+1. Profile 字段人工确认、字段冲突 UI、`effectiveProfile` 是 v0.3。
+2. ProposalDraft adapter 和 proposal fixture 是 v0.5，不能放进 v0.2 验收。
+3. Snapshot retention 的实际清理按钮和压缩/脱敏策略 UI 尚未实现；当前 v0.2 只定义状态并保留数据结构。
+4. 完整 Chrome unpacked extension runtime smoke 仍需人工或专门 Playwright persistent extension context 验证；当前 MCP 测试覆盖 Options UI，不等同于真实扩展上下文。
+
 ## 10. 字段唯一性契约：防止业务字段错位
 
 本节解决一个强约束：每一个业务概念必须只有一个 canonical 数据结构和字段路径。Create、Read、Update、Delete、汇总、长期存储必须指向同一个字段，不能出现“新增写 A 字段、查询读 B 字段、更新改 C 字段、汇总用 D 字段”的错位。
@@ -1914,6 +1932,6 @@ v0.2 必须补上字段一致性测试，不允许只靠人工检查：
 2. 新增 legacy mapper 测试：v0.1 `total_score` 必须映射到 `totalScore`，`decision_summary` 必须映射到 `decisionSummary`。
 3. 新增 list/detail contract 测试：`listSummary` 不包含 `Snapshot.text`。
 4. 新增 score fixture 测试：OpenAI snake_case fake response 经 adapter 后只保存 camelCase canonical fields。
-5. 新增 proposal fixture 测试：`questions_to_ask` 经 adapter 后保存为 `questionsToAsk`。
+5. Proposal fixture 测试不属于 v0.2；v0.5 引入 ProposalDraft adapter 时必须新增 `questions_to_ask -> questionsToAsk` 验收。
 6. 新增 notes stale 测试：notes revision 更新后，旧 ScoreResult 仍引用旧 `notesRevisionId`，当前 Opportunity 指向新 revision。
 7. 新增 import validation：发现未知可写字段、缺失 required canonical field、引用不存在 id 时拒绝导入。
