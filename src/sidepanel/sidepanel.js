@@ -1,7 +1,9 @@
 import { PROFILE_FIELD_DEFINITIONS } from "../shared/adapters.js";
+import { OUTCOME_STATUS } from "../shared/schema.js";
 
 const panelStatus = document.querySelector("#panelStatus");
 const opportunitySelect = document.querySelector("#opportunitySelect");
+const outcomeFilter = document.querySelector("#outcomeFilter");
 const captureButton = document.querySelector("#captureButton");
 const scoreButton = document.querySelector("#scoreButton");
 const deleteButton = document.querySelector("#deleteButton");
@@ -26,10 +28,23 @@ const proposalBadge = document.querySelector("#proposalBadge");
 const proposalRiskPanel = document.querySelector("#proposalRiskPanel");
 const proposalOutput = document.querySelector("#proposalOutput");
 const proposalDetailsPanel = document.querySelector("#proposalDetailsPanel");
+const outcomeBadge = document.querySelector("#outcomeBadge");
+const outcomeSummaryPanel = document.querySelector("#outcomeSummaryPanel");
+const outcomeEventType = document.querySelector("#outcomeEventType");
+const outcomeOccurredAt = document.querySelector("#outcomeOccurredAt");
+const outcomeConnectsSpent = document.querySelector("#outcomeConnectsSpent");
+const outcomeBidAmount = document.querySelector("#outcomeBidAmount");
+const outcomeBidType = document.querySelector("#outcomeBidType");
+const outcomeEventSelect = document.querySelector("#outcomeEventSelect");
+const outcomeNotes = document.querySelector("#outcomeNotes");
+const saveOutcomeEventButton = document.querySelector("#saveOutcomeEventButton");
+const voidOutcomeEventButton = document.querySelector("#voidOutcomeEventButton");
+const outcomeTimeline = document.querySelector("#outcomeTimeline");
 
 let opportunities = [];
 let selectedId = null;
 let selectedOpportunity = null;
+let selectedOutcomeFilter = "";
 
 init();
 
@@ -40,6 +55,13 @@ async function init() {
 
 function bindEvents() {
   refreshButton.addEventListener("click", refresh);
+  outcomeFilter.addEventListener("change", () => {
+    selectedOutcomeFilter = outcomeFilter.value;
+    const visible = getVisibleOpportunities();
+    if (!visible.some((item) => item.id === selectedId)) selectedId = visible[0]?.id || "";
+    renderOpportunitySelect();
+    loadSelected();
+  });
   opportunitySelect.addEventListener("change", () => {
     selectedId = opportunitySelect.value;
     loadSelected();
@@ -56,13 +78,16 @@ function bindEvents() {
   saveProposalButton.addEventListener("click", saveProposalEdit);
   copyProposalButton.addEventListener("click", copyProposalText);
   archiveProposalButton.addEventListener("click", archiveProposal);
+  saveOutcomeEventButton.addEventListener("click", saveOutcomeEvent);
+  voidOutcomeEventButton.addEventListener("click", voidSelectedOutcomeEvent);
 }
 
 async function refresh() {
   const response = await send({ type: "opportunities:listSummary" });
   opportunities = response.opportunities || [];
-  if (!selectedId || !opportunities.some((item) => item.id === selectedId)) {
-    selectedId = opportunities[0]?.id || "";
+  const visible = getVisibleOpportunities();
+  if (!selectedId || !visible.some((item) => item.id === selectedId)) {
+    selectedId = visible[0]?.id || "";
   }
   renderOpportunitySelect();
   await loadSelected();
@@ -123,7 +148,7 @@ async function permanentDeleteSelected() {
   if (!selectedId) return;
   const opportunity = getSelected();
   const title = opportunity?.title || "this opportunity";
-  const warning = `Permanently delete "${title}" and its snapshots, notes, profiles, and scores? This cannot be undone.`;
+  const warning = `Permanently delete "${title}" and its snapshots, notes, profiles, scores, proposals, and outcomes? This cannot be undone.`;
   if (!confirm(warning)) return;
   if (prompt("Type DELETE to permanently delete this opportunity.") !== "DELETE") {
     setStatus("Permanent delete canceled");
@@ -284,19 +309,62 @@ async function archiveProposal() {
   }
 }
 
+async function saveOutcomeEvent() {
+  if (!selectedId) return;
+  setStatus("Recording outcome...");
+  setBusy(true);
+  try {
+    const response = await send({
+      type: "outcome:appendEvent",
+      opportunityId: selectedId,
+      event: collectOutcomeEventInput()
+    });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Outcome recorded");
+    outcomeNotes.value = "";
+    renderSelected();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function voidSelectedOutcomeEvent() {
+  const eventId = outcomeEventSelect.value;
+  if (!eventId) return;
+  if (!confirm("Void this outcome event? The event stays in the timeline as voided.")) return;
+  setStatus("Voiding outcome event...");
+  setBusy(true);
+  try {
+    const response = await send({ type: "outcome:voidEvent", id: eventId, reason: outcomeNotes.value });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Outcome event voided");
+    renderSelected();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function renderOpportunitySelect() {
   opportunitySelect.innerHTML = "";
-  if (!opportunities.length) {
+  outcomeFilter.value = selectedOutcomeFilter;
+  const visible = getVisibleOpportunities();
+  if (!visible.length) {
     const option = document.createElement("option");
     option.value = "";
     option.textContent = "No opportunities yet";
     opportunitySelect.append(option);
     return;
   }
-  for (const opportunity of opportunities) {
+  for (const opportunity of visible) {
     const option = document.createElement("option");
     option.value = opportunity.id;
-    option.textContent = `${scoreLabel(opportunity)} ${opportunity.title}`;
+    option.textContent = `${scoreLabel(opportunity)} ${outcomeLabel(opportunity.outcomeSummary?.status)} ${opportunity.title}`;
     opportunitySelect.append(option);
   }
   opportunitySelect.value = selectedId;
@@ -317,6 +385,7 @@ function renderSelected() {
     notesInput.value = "";
     renderProfileEditor(null);
     renderProposal(null);
+    renderOutcome(null);
     return;
   }
 
@@ -326,6 +395,7 @@ function renderSelected() {
   renderSnapshots(opportunity);
   renderDetails(opportunity);
   renderProposal(opportunity);
+  renderOutcome(opportunity);
 }
 
 function renderSummary(opportunity) {
@@ -557,6 +627,89 @@ function renderProposalRisks(draft) {
   `;
 }
 
+function renderOutcome(opportunity) {
+  saveOutcomeEventButton.disabled = !opportunity;
+  const events = opportunity?.outcomeEvents || [];
+  const summary = opportunity?.outcomeSummary || { status: OUTCOME_STATUS.notApplied };
+
+  if (!opportunity) {
+    outcomeBadge.className = "badge";
+    outcomeBadge.textContent = "Not applied";
+    outcomeSummaryPanel.className = "details empty";
+    outcomeSummaryPanel.textContent = "No outcome events.";
+    outcomeTimeline.className = "list empty";
+    outcomeTimeline.textContent = "No outcome timeline.";
+    outcomeEventSelect.innerHTML = "<option value=\"\">No events</option>";
+    saveOutcomeEventButton.disabled = true;
+    voidOutcomeEventButton.disabled = true;
+    return;
+  }
+
+  outcomeBadge.className = `badge${summary.status === OUTCOME_STATUS.hired ? " reviewed" : ""}`;
+  outcomeBadge.textContent = outcomeLabel(summary.status);
+  outcomeSummaryPanel.className = "details";
+  outcomeSummaryPanel.innerHTML = `
+    <article class="dimension">
+      <header><strong>Status</strong><span>${escapeHtml(outcomeLabel(summary.status))}</span></header>
+      <small>applied ${escapeHtml(formatDateTime(summary.appliedAt) || "none")}</small>
+      <small>viewed ${escapeHtml(formatDateTime(summary.viewedAt) || "none")}</small>
+      <small>replied ${escapeHtml(formatDateTime(summary.repliedAt) || "none")}</small>
+      <small>interview ${escapeHtml(formatDateTime(summary.interviewAt) || "none")}</small>
+      <small>hired ${escapeHtml(formatDateTime(summary.hiredAt) || "none")}</small>
+      <small>lost ${escapeHtml(formatDateTime(summary.lostAt) || "none")}</small>
+      <small>connects ${escapeHtml(summary.connectsSpent ?? "none")}</small>
+      <small>bid ${escapeHtml(formatBid(summary))}</small>
+    </article>
+  `;
+
+  outcomeEventSelect.innerHTML = "";
+  const activeEvents = events.filter((item) => !item.voidedAt);
+  if (!activeEvents.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No events";
+    outcomeEventSelect.append(option);
+  } else {
+    for (const event of activeEvents.slice().reverse()) {
+      const option = document.createElement("option");
+      option.value = event.id;
+      option.textContent = `${eventLabel(event.eventType)} ${formatDateTime(event.occurredAt)}`;
+      outcomeEventSelect.append(option);
+    }
+  }
+  voidOutcomeEventButton.disabled = activeEvents.length === 0;
+
+  if (!events.length) {
+    outcomeTimeline.className = "list empty";
+    outcomeTimeline.textContent = "No outcome timeline.";
+    return;
+  }
+  outcomeTimeline.className = "list";
+  outcomeTimeline.innerHTML = events.slice().reverse().map((event) => `
+    <div class="snapshot${event.voidedAt ? " voided" : ""}">
+      <strong>${escapeHtml(eventLabel(event.eventType))}${event.voidedAt ? " (voided)" : ""}</strong>
+      <span>${escapeHtml(formatDateTime(event.occurredAt))}</span>
+      <small>${escapeHtml(event.source)}${event.snapshotId ? ` · snapshot ${escapeHtml(event.snapshotId)}` : ""}</small>
+      ${renderOutcomePayload(event)}
+      ${event.notes ? `<small>${escapeHtml(event.notes)}</small>` : ""}
+    </div>
+  `).join("");
+}
+
+function renderOutcomePayload(event) {
+  if (event.eventType === "proposal_sent") {
+    return [
+      event.payload?.connectsSpent !== null && event.payload?.connectsSpent !== undefined ? `<small>connects ${escapeHtml(event.payload.connectsSpent)}</small>` : "",
+      event.payload?.bidAmount !== null && event.payload?.bidAmount !== undefined ? `<small>bid ${escapeHtml(event.payload.bidCurrency || "")} ${escapeHtml(event.payload.bidAmount)} ${escapeHtml(event.payload.bidType || "")}</small>` : "",
+      event.payload?.proposalDraftId ? `<small>proposal ${escapeHtml(event.payload.proposalDraftId)}</small>` : ""
+    ].filter(Boolean).join("");
+  }
+  if (event.eventType === "capture_detected_status") {
+    return `<small>detected ${escapeHtml(outcomeLabel(event.payload?.detectedStatus))}</small>`;
+  }
+  return "";
+}
+
 function renderList(title, values) {
   if (!values?.length) return "";
   return `
@@ -579,6 +732,31 @@ function collectProfileFieldValues() {
   return values;
 }
 
+function collectOutcomeEventInput() {
+  const occurredAt = outcomeOccurredAt.value
+    ? new Date(outcomeOccurredAt.value).toISOString()
+    : new Date().toISOString();
+  const payload = {};
+  if (outcomeEventType.value === "proposal_sent") {
+    payload.connectsSpent = outcomeConnectsSpent.value === "" ? null : Number(outcomeConnectsSpent.value);
+    payload.bidAmount = outcomeBidAmount.value === "" ? null : Number(outcomeBidAmount.value);
+    payload.bidCurrency = "USD";
+    payload.bidType = outcomeBidType.value || "unknown";
+    payload.proposalDraftId = selectedOpportunity?.currentProposalDraftId || selectedOpportunity?.proposalDraft?.id || null;
+  }
+  return {
+    eventType: outcomeEventType.value,
+    occurredAt,
+    payload,
+    notes: outcomeNotes.value
+  };
+}
+
+function getVisibleOpportunities() {
+  if (!selectedOutcomeFilter) return opportunities;
+  return opportunities.filter((item) => (item.outcomeSummary?.status || OUTCOME_STATUS.notApplied) === selectedOutcomeFilter);
+}
+
 function formatProfileFieldValue(value) {
   return Array.isArray(value) ? value.join("\n") : String(value || "");
 }
@@ -596,7 +774,13 @@ function sourceLabel(source) {
 
 function updateOpportunitySummary(opportunity) {
   const index = opportunities.findIndex((item) => item.id === opportunity.id);
-  if (index >= 0) opportunities[index] = opportunity;
+  if (index >= 0) {
+    opportunities[index] = {
+      ...opportunities[index],
+      ...opportunity,
+      snapshots: undefined
+    };
+  }
 }
 
 function getSelected() {
@@ -616,6 +800,8 @@ function setBusy(isBusy) {
   saveProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft;
   copyProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft?.finalText;
   archiveProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft;
+  saveOutcomeEventButton.disabled = isBusy || !selectedId;
+  voidOutcomeEventButton.disabled = isBusy || !selectedOutcomeEventId();
 }
 
 function setStatus(message) {
@@ -625,6 +811,51 @@ function setStatus(message) {
 function scoreLabel(opportunity) {
   const score = opportunity.scoreResult?.total_score ?? opportunity.currentScore?.totalScore;
   return Number.isFinite(score) ? `${Math.round(score)}/100` : "Draft";
+}
+
+function selectedOutcomeEventId() {
+  return outcomeEventSelect.value || "";
+}
+
+function outcomeLabel(status) {
+  const labels = {
+    not_applied: "Not applied",
+    skipped: "Skipped",
+    applied: "Applied",
+    viewed: "Viewed",
+    replied: "Replied",
+    interviewing: "Interviewing",
+    hired: "Hired",
+    lost: "Lost"
+  };
+  return labels[status] || "Not applied";
+}
+
+function eventLabel(eventType) {
+  const labels = {
+    marked_not_applied: "Not applied",
+    marked_skipped: "Skipped",
+    proposal_sent: "Proposal sent",
+    proposal_viewed: "Proposal viewed",
+    client_replied: "Client replied",
+    interview_started: "Interview started",
+    hired: "Hired",
+    lost: "Lost",
+    manual_note: "Manual note",
+    capture_detected_status: "Capture detected",
+    correction: "Correction",
+    voided: "Voided"
+  };
+  return labels[eventType] || eventType;
+}
+
+function formatDateTime(value) {
+  return value ? new Date(value).toLocaleString() : "";
+}
+
+function formatBid(summary) {
+  if (summary.bidAmount === null || summary.bidAmount === undefined) return "none";
+  return `${summary.bidCurrency || "USD"} ${summary.bidAmount} ${summary.bidType || ""}`.trim();
 }
 
 function send(message) {

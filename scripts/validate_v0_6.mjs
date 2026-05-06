@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_SETTINGS,
   OPPORTUNITY_STATUS,
+  OUTCOME_EVENT_TYPE,
+  OUTCOME_STATUS,
   PLAN_VERSION,
   PLATFORM_HOSTS,
   PROPOSAL_DRAFT_STATUS,
@@ -41,9 +43,11 @@ for (const file of jsFiles) {
 assert.equal(SCHEMA_VERSION, 1);
 assert.equal(DEFAULT_SETTINGS.captureMode, "strict_upwork");
 assert.equal(PLATFORM_HOSTS.upwork, "www.upwork.com");
-assert.equal(PLAN_VERSION, "0.5.0");
+assert.equal(PLAN_VERSION, "0.6.0");
 assert.equal(OPPORTUNITY_STATUS.draft, "draft");
 assert.equal(OPPORTUNITY_STATUS.captured, "captured");
+assert.equal(OUTCOME_STATUS.applied, "applied");
+assert.equal(OUTCOME_EVENT_TYPE.proposalSent, "proposal_sent");
 assert.equal(PROPOSAL_DRAFT_STATUS.generated, "generated");
 assert.equal(PROPOSAL_DRAFT_STATUS.edited, "edited");
 assert.equal(SNAPSHOT_RETENTION_STATE.deletedReferenceOnly, "deleted_reference_only");
@@ -234,7 +238,7 @@ assert.equal(missingReferencePreview.ok, false);
 assert.match(missingReferencePreview.error, /references missing opportunity/);
 
 const unsupportedFutureEntity = structuredClone(validImportPayload);
-unsupportedFutureEntity.data[STORAGE_KEYS.outcomeEvents] = [{ id: "event_1" }];
+unsupportedFutureEntity.data[STORAGE_KEYS.clientRecords] = [{ id: "client_1" }];
 const unsupportedFutureEntityPreview = await sendBackgroundMessage({ type: "data:importPreview", data: unsupportedFutureEntity });
 assert.equal(unsupportedFutureEntityPreview.ok, false);
 assert.match(unsupportedFutureEntityPreview.error, /import is not supported yet/);
@@ -281,9 +285,10 @@ await runMyProfilePortfolioTests();
 await runProfileReviewTests();
 await runPersonalContextScoreTests();
 await runProposalDraftTests();
+await runOutcomeEventTests();
 await runScoreTests();
 
-console.log("v0.5 validation passed");
+console.log("v0.6 validation passed");
 
 async function runSettingsExportBackupTests() {
   const harness = await loadBackgroundForValidation({
@@ -526,6 +531,10 @@ async function runArchiveRestoreDeleteTests() {
       [STORAGE_KEYS.proposalDrafts]: [
         makeProposalDraft("proposal_delete", "opp_delete", { inputScoreResultId: "score_delete" }),
         makeProposalDraft("proposal_keep", "opp_keep", { inputScoreResultId: "score_keep" })
+      ],
+      [STORAGE_KEYS.outcomeEvents]: [
+        makeOutcomeEvent("outcome_delete", "opp_delete", { eventType: OUTCOME_EVENT_TYPE.proposalSent }),
+        makeOutcomeEvent("outcome_keep", "opp_keep", { eventType: OUTCOME_EVENT_TYPE.proposalSent })
       ]
     }
   });
@@ -547,9 +556,11 @@ async function runArchiveRestoreDeleteTests() {
   assert.equal(harness.storageData[STORAGE_KEYS.scoreResults].some((item) => item.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.noteRevisions].some((item) => item.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.proposalDrafts].some((item) => item.opportunityId === "opp_delete"), false);
+  assert.equal(harness.storageData[STORAGE_KEYS.outcomeEvents].some((item) => item.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.opportunities].some((item) => item.id === "opp_keep"), true);
   assert.equal(harness.storageData[STORAGE_KEYS.snapshots].some((item) => item.opportunityId === "opp_keep"), true);
   assert.equal(harness.storageData[STORAGE_KEYS.proposalDrafts].some((item) => item.opportunityId === "opp_keep"), true);
+  assert.equal(harness.storageData[STORAGE_KEYS.outcomeEvents].some((item) => item.opportunityId === "opp_keep"), true);
 }
 
 async function runNotesStaleTests() {
@@ -917,6 +928,167 @@ async function runProposalDraftTests() {
   const badSourcePreview = await sendBackgroundMessage({ type: "data:importPreview", data: badSourceImport });
   assert.equal(badSourcePreview.ok, false);
   assert.match(badSourcePreview.error, /missing selected Portfolio Case/);
+}
+
+async function runOutcomeEventTests() {
+  const outcomeStorageData = {
+    [STORAGE_KEYS.opportunities]: [makeOpportunity("opp_outcome", {
+      status: OPPORTUNITY_STATUS.scored,
+      snapshotIds: ["snap_outcome"],
+      currentScoreResultId: "score_outcome",
+      currentProposalDraftId: "draft_outcome"
+    })],
+    [STORAGE_KEYS.snapshots]: [makeSnapshot("snap_outcome", "opp_outcome")],
+    [STORAGE_KEYS.scoreResults]: [makeScore("score_outcome", "opp_outcome")],
+    [STORAGE_KEYS.proposalDrafts]: [makeProposalDraft("draft_outcome", "opp_outcome", { inputScoreResultId: "score_outcome" })]
+  };
+  const harness = await loadBackgroundForValidation({ storageData: outcomeStorageData });
+
+  const sent = await harness({
+    type: "outcome:appendEvent",
+    opportunityId: "opp_outcome",
+    event: {
+      eventType: OUTCOME_EVENT_TYPE.proposalSent,
+      occurredAt: "2026-05-06T01:00:00.000Z",
+      payload: {
+        connectsSpent: 12,
+        bidAmount: 1500,
+        bidCurrency: "USD",
+        bidType: "fixed",
+        proposalDraftId: "draft_outcome"
+      },
+      notes: "Submitted manually"
+    }
+  });
+  assert.equal(sent.ok, true);
+  assert.equal(harness.storageData[STORAGE_KEYS.outcomeEvents].length, 1);
+  assert.equal(sent.opportunity.outcomeSummary.status, OUTCOME_STATUS.applied);
+  assert.equal(sent.opportunity.outcomeSummary.connectsSpent, 12);
+  assert.equal(sent.opportunity.outcomeSummary.bidAmount, 1500);
+
+  const viewed = await harness({
+    type: "outcome:appendEvent",
+    opportunityId: "opp_outcome",
+    event: {
+      eventType: OUTCOME_EVENT_TYPE.proposalViewed,
+      occurredAt: "2026-05-06T02:00:00.000Z",
+      notes: "Client viewed"
+    }
+  });
+  assert.equal(viewed.opportunity.outcomeSummary.status, OUTCOME_STATUS.viewed);
+  assert.equal(viewed.opportunity.outcomeSummary.viewedAt, "2026-05-06T02:00:00.000Z");
+
+  const lost = await harness({
+    type: "outcome:create",
+    opportunityId: "opp_outcome",
+    event: {
+      eventType: OUTCOME_EVENT_TYPE.lost,
+      occurredAt: "2026-05-06T03:00:00.000Z",
+      notes: "Not selected"
+    }
+  });
+  assert.equal(lost.opportunity.outcomeSummary.status, OUTCOME_STATUS.lost);
+  const lostEventId = harness.storageData[STORAGE_KEYS.outcomeEvents].find((item) => item.eventType === OUTCOME_EVENT_TYPE.lost).id;
+
+  const listed = await harness({ type: "outcome:listEvents", opportunityId: "opp_outcome" });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.outcomeEvents.length, 3);
+
+  const voided = await harness({ type: "outcome:voidEvent", id: lostEventId, reason: "Wrong opportunity" });
+  assert.equal(voided.ok, true);
+  assert.equal(voided.opportunity.outcomeSummary.status, OUTCOME_STATUS.viewed);
+  const listedAfterVoid = await harness({ type: "outcome:list", opportunityId: "opp_outcome" });
+  assert.equal(listedAfterVoid.outcomeEvents.length, 2);
+  const listedWithVoided = await harness({ type: "outcome:list", opportunityId: "opp_outcome", includeVoided: true });
+  assert.equal(listedWithVoided.outcomeEvents.length, 3);
+
+  const summary = await harness({ type: "outcome:getSummary", opportunityId: "opp_outcome" });
+  assert.equal(summary.ok, true);
+  assert.equal(summary.outcomeSummary.status, OUTCOME_STATUS.viewed);
+
+  const summaries = await harness({ type: "opportunities:listSummary" });
+  assert.equal(summaries.opportunities[0].outcomeSummary.status, OUTCOME_STATUS.viewed);
+
+  const exported = await harness({ type: "data:export" });
+  assert.equal(exported.exportData.manifest.entityCounts.outcomeEvents, 3);
+
+  const invalidType = await harness({
+    type: "outcome:appendEvent",
+    opportunityId: "opp_outcome",
+    event: { eventType: "bad_event", occurredAt: "2026-05-06T04:00:00.000Z" }
+  });
+  assert.equal(invalidType.ok, false);
+  assert.match(invalidType.error, /Unsupported outcome event type/);
+  assert.equal(harness.storageData[STORAGE_KEYS.outcomeEvents].length, 3);
+
+  const badDraft = await harness({
+    type: "outcome:appendEvent",
+    opportunityId: "opp_outcome",
+    event: {
+      eventType: OUTCOME_EVENT_TYPE.proposalSent,
+      occurredAt: "2026-05-06T05:00:00.000Z",
+      payload: { proposalDraftId: "missing_draft" }
+    }
+  });
+  assert.equal(badDraft.ok, false);
+  assert.match(badDraft.error, /missing ProposalDraft/);
+
+  const captureHarness = await loadBackgroundForValidation({
+    storageData: {
+      [STORAGE_KEYS.opportunities]: [makeOpportunity("opp_capture_outcome", { snapshotIds: ["snap_existing"] })],
+      [STORAGE_KEYS.snapshots]: [makeSnapshot("snap_existing", "opp_capture_outcome")]
+    }
+  });
+  captureHarness.setActiveTab({ id: 1, url: "https://www.upwork.com/jobs/details/opp_capture_outcome", title: "Outcome capture" });
+  captureHarness.setCaptureResult(makeCaptureResult(
+    "https://www.upwork.com/jobs/details/opp_capture_outcome",
+    "Outcome capture",
+    "Client viewed your proposal on this job."
+  ));
+  const captured = await captureHarness({ type: "capture:currentPage", opportunityId: "opp_capture_outcome" });
+  assert.equal(captured.ok, true);
+  assert.equal(captureHarness.storageData[STORAGE_KEYS.outcomeEvents].length, 1);
+  assert.equal(captured.opportunity.outcomeSummary.status, OUTCOME_STATUS.viewed);
+  assert.equal(captureHarness.storageData[STORAGE_KEYS.outcomeEvents][0].eventType, OUTCOME_EVENT_TYPE.captureDetectedStatus);
+
+  const outcomeImport = structuredClone(validImportPayload);
+  outcomeImport.data[STORAGE_KEYS.opportunities] = [makeOpportunity("opp_import_outcome", {
+    snapshotIds: ["snap_import_outcome"],
+    currentProposalDraftId: "draft_import_outcome"
+  })];
+  outcomeImport.data[STORAGE_KEYS.snapshots] = [makeSnapshot("snap_import_outcome", "opp_import_outcome")];
+  outcomeImport.data[STORAGE_KEYS.scoreResults] = [makeScore("score_import_outcome", "opp_import_outcome")];
+  outcomeImport.data[STORAGE_KEYS.myProfile] = makeMyProfile("my_profile_proposal");
+  outcomeImport.data[STORAGE_KEYS.portfolioCases] = [makePortfolioCase("case_relevant")];
+  outcomeImport.data[STORAGE_KEYS.proposalDrafts] = [makeProposalDraft("draft_import_outcome", "opp_import_outcome", {
+    inputScoreResultId: "score_import_outcome",
+    sourceRefs: [{
+      sourceType: "score_result",
+      sourceId: "score_import_outcome",
+      fieldKey: "proposalAngle",
+      label: "Score proposal angle",
+      quote: "Lead with extension experience"
+    }]
+  })];
+  outcomeImport.data[STORAGE_KEYS.outcomeEvents] = [makeOutcomeEvent("outcome_import", "opp_import_outcome", {
+    payload: {
+      connectsSpent: 10,
+      bidAmount: 900,
+      bidCurrency: "USD",
+      bidType: "fixed",
+      proposalDraftId: "draft_import_outcome",
+      proposalTextRevisionId: null
+    }
+  })];
+  const outcomeImportPreview = await sendBackgroundMessage({ type: "data:importPreview", data: outcomeImport });
+  assert.equal(outcomeImportPreview.ok, true);
+  assert.equal(outcomeImportPreview.preview.entityCounts.outcomeEvents, 1);
+
+  const badOutcomeImport = structuredClone(outcomeImport);
+  badOutcomeImport.data[STORAGE_KEYS.outcomeEvents][0].payload.proposalDraftId = "missing_draft";
+  const badOutcomePreview = await sendBackgroundMessage({ type: "data:importPreview", data: badOutcomeImport });
+  assert.equal(badOutcomePreview.ok, false);
+  assert.match(badOutcomePreview.error, /missing ProposalDraft/);
 }
 
 async function runScoreTests() {
@@ -1334,6 +1506,36 @@ function makeProposalDraft(id = "draft_extension", opportunityId = "opp_extensio
     }],
     revisions: [],
     archivedAt: null,
+    ...overrides
+  };
+}
+
+function makeOutcomeEvent(id = "outcome_event", opportunityId = "opp_extension", overrides = {}) {
+  const now = "2026-05-06T00:00:00.000Z";
+  const eventType = overrides.eventType || OUTCOME_EVENT_TYPE.proposalSent;
+  const payload = eventType === OUTCOME_EVENT_TYPE.proposalSent
+    ? {
+      connectsSpent: 8,
+      bidAmount: 1200,
+      bidCurrency: "USD",
+      bidType: "fixed",
+      proposalDraftId: null,
+      proposalTextRevisionId: null
+    }
+    : {};
+  return {
+    id,
+    opportunityId,
+    schemaVersion: SCHEMA_VERSION,
+    eventType,
+    occurredAt: now,
+    recordedAt: now,
+    source: "manual",
+    snapshotId: null,
+    payload,
+    notes: "Outcome note",
+    correctionOfEventId: null,
+    voidedAt: null,
     ...overrides
   };
 }

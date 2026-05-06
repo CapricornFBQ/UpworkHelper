@@ -20,6 +20,7 @@ const smokeOpportunityId = "opp_smoke_notes_failure";
 const smokeProfileId = "profile_smoke_notes_failure";
 const smokeScoreId = "score_smoke_notes_failure";
 const smokeProposalId = "proposal_smoke_notes_failure";
+const smokeOutcomeId = "outcome_smoke_notes_failure";
 let chromeProcess = null;
 let client = null;
 
@@ -165,6 +166,11 @@ async function smokeSidePanelPage(extensionId) {
     "#archiveProposalButton",
     "#proposalOutput",
     "#proposalRiskPanel",
+    "#outcomeFilter",
+    "#outcomeEventType",
+    "#saveOutcomeEventButton",
+    "#voidOutcomeEventButton",
+    "#outcomeTimeline",
     "#profileFieldsPanel",
     "#profileConflictsPanel",
     "#panelStatus"
@@ -182,6 +188,9 @@ async function smokeSidePanelPage(extensionId) {
       document.querySelector("#profileConflictsPanel").textContent.includes("Corrected smoke title") &&
       document.querySelector("#proposalOutput").value.includes("Smoke proposal text") &&
       document.querySelector("#proposalRiskPanel").textContent.includes("Unsupported smoke claim") &&
+      document.querySelector("#outcomeBadge").textContent === "Applied" &&
+      document.querySelector("#outcomeTimeline").textContent.includes("Proposal sent") &&
+      document.querySelector("#outcomeSummaryPanel").textContent.includes("connects 6") &&
       !document.querySelector("#saveNotesButton").disabled
     `);
   });
@@ -368,7 +377,27 @@ async function seedSmokeOpportunity(sessionId) {
         revisions: [],
         archivedAt: null
       }],
-      [STORAGE_KEYS.outcomeEvents]: [],
+      [STORAGE_KEYS.outcomeEvents]: [{
+        id: smokeOutcomeId,
+        opportunityId: smokeOpportunityId,
+        schemaVersion: SCHEMA_VERSION,
+        eventType: "proposal_sent",
+        occurredAt: now,
+        recordedAt: now,
+        source: "manual",
+        snapshotId: null,
+        payload: {
+          connectsSpent: 6,
+          bidAmount: 800,
+          bidCurrency: "USD",
+          bidType: "fixed",
+          proposalDraftId: smokeProposalId,
+          proposalTextRevisionId: null
+        },
+        notes: "Smoke outcome event",
+        correctionOfEventId: null,
+        voidedAt: null
+      }],
       [STORAGE_KEYS.clientRecords]: [],
       [STORAGE_KEYS.fieldSelectors]: [],
       [STORAGE_KEYS.analyticsCache]: {}

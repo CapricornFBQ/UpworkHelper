@@ -1,4 +1,4 @@
-export const PLAN_VERSION = "0.5.0";
+export const PLAN_VERSION = "0.6.0";
 export const SCHEMA_VERSION = 1;
 
 export const STORAGE_KEYS = Object.freeze({
@@ -52,6 +52,32 @@ export const PROPOSAL_DRAFT_STATUS = Object.freeze({
   generated: "generated",
   edited: "edited",
   archived: "archived"
+});
+
+export const OUTCOME_STATUS = Object.freeze({
+  notApplied: "not_applied",
+  skipped: "skipped",
+  applied: "applied",
+  viewed: "viewed",
+  replied: "replied",
+  interviewing: "interviewing",
+  hired: "hired",
+  lost: "lost"
+});
+
+export const OUTCOME_EVENT_TYPE = Object.freeze({
+  markedNotApplied: "marked_not_applied",
+  markedSkipped: "marked_skipped",
+  proposalSent: "proposal_sent",
+  proposalViewed: "proposal_viewed",
+  clientReplied: "client_replied",
+  interviewStarted: "interview_started",
+  hired: "hired",
+  lost: "lost",
+  manualNote: "manual_note",
+  captureDetectedStatus: "capture_detected_status",
+  correction: "correction",
+  voided: "voided"
 });
 
 export const PROMPT_VERSIONS = Object.freeze({

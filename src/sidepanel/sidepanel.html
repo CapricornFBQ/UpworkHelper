@@ -19,6 +19,18 @@
       <section class="panel">
         <label for="opportunitySelect">Opportunity</label>
         <select id="opportunitySelect"></select>
+        <label for="outcomeFilter" class="compact-label">Outcome filter</label>
+        <select id="outcomeFilter">
+          <option value="">All outcomes</option>
+          <option value="not_applied">Not applied</option>
+          <option value="skipped">Skipped</option>
+          <option value="applied">Applied</option>
+          <option value="viewed">Viewed</option>
+          <option value="replied">Replied</option>
+          <option value="interviewing">Interviewing</option>
+          <option value="hired">Hired</option>
+          <option value="lost">Lost</option>
+        </select>
         <div class="button-row">
           <button id="captureButton">Capture page</button>
           <button id="scoreButton" class="primary">Score</button>
@@ -78,6 +90,63 @@
           <textarea id="proposalOutput" rows="12" placeholder="Generate a proposal after scoring."></textarea>
         </label>
         <div id="proposalDetailsPanel" class="details empty">No proposal metadata.</div>
+      </section>
+
+      <section class="panel">
+        <div class="section-header">
+          <h2>Outcome</h2>
+          <span id="outcomeBadge" class="badge">Not applied</span>
+        </div>
+        <div id="outcomeSummaryPanel" class="details empty">No outcome events.</div>
+        <div class="grid-2">
+          <label for="outcomeEventType">
+            Event
+            <select id="outcomeEventType">
+              <option value="proposal_sent">Proposal sent</option>
+              <option value="proposal_viewed">Proposal viewed</option>
+              <option value="client_replied">Client replied</option>
+              <option value="interview_started">Interview started</option>
+              <option value="hired">Hired</option>
+              <option value="lost">Lost</option>
+              <option value="marked_skipped">Skipped</option>
+              <option value="marked_not_applied">Not applied</option>
+              <option value="manual_note">Manual note</option>
+            </select>
+          </label>
+          <label for="outcomeOccurredAt">
+            Occurred at
+            <input id="outcomeOccurredAt" type="datetime-local">
+          </label>
+          <label for="outcomeConnectsSpent">
+            Connects
+            <input id="outcomeConnectsSpent" type="number" min="0" step="1">
+          </label>
+          <label for="outcomeBidAmount">
+            Bid amount
+            <input id="outcomeBidAmount" type="number" min="0" step="0.01">
+          </label>
+          <label for="outcomeBidType">
+            Bid type
+            <select id="outcomeBidType">
+              <option value="fixed">Fixed</option>
+              <option value="hourly">Hourly</option>
+              <option value="unknown">Unknown</option>
+            </select>
+          </label>
+          <label for="outcomeEventSelect">
+            Event to void
+            <select id="outcomeEventSelect"></select>
+          </label>
+        </div>
+        <label for="outcomeNotes" class="proposal-output-label">
+          Outcome notes
+          <textarea id="outcomeNotes" rows="4" placeholder="Record bid, reply, interview, or result details..."></textarea>
+        </label>
+        <div class="button-row">
+          <button id="saveOutcomeEventButton" class="primary">Record outcome</button>
+          <button id="voidOutcomeEventButton" class="danger">Void selected event</button>
+        </div>
+        <div id="outcomeTimeline" class="list empty">No outcome timeline.</div>
       </section>
     </main>
 

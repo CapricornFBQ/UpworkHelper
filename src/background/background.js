@@ -1,6 +1,8 @@
 import {
   DEFAULT_SETTINGS,
   OPPORTUNITY_STATUS,
+  OUTCOME_EVENT_TYPE,
+  OUTCOME_STATUS,
   PLATFORM_HOSTS,
   PROPOSAL_DRAFT_STATUS,
   PROMPT_VERSIONS,
@@ -28,9 +30,11 @@ const SNAPSHOT_COMPACT_CHARS = 2000;
 const BACKUP_PREFIX = "uosc_backup_v0_to_v1_";
 const SCORE_DECISIONS = ["strong_apply", "targeted_apply", "only_if_strong_fit", "skip"];
 const PROPOSAL_SOURCE_TYPES = Object.freeze(["opportunity_field", "snapshot_evidence", "my_profile", "portfolio_case", "notes", "score_result"]);
+const OUTCOME_EVENT_TYPES = Object.freeze(Object.values(OUTCOME_EVENT_TYPE));
+const OUTCOME_STATUSES = Object.freeze(Object.values(OUTCOME_STATUS));
+const OUTCOME_EVENT_SOURCES = Object.freeze(["manual", "capture", "import"]);
 const MANAGED_STORAGE_KEYS = Object.freeze(Object.values(STORAGE_KEYS));
 const UNIMPLEMENTED_IMPORT_KEYS = Object.freeze([
-  STORAGE_KEYS.outcomeEvents,
   STORAGE_KEYS.clientRecords,
   STORAGE_KEYS.fieldSelectors,
   STORAGE_KEYS.analyticsCache
@@ -141,6 +145,17 @@ async function handleMessage(message) {
     case "proposal:archive":
     case "proposal:delete":
       return { ok: true, opportunity: await archiveProposalDraft(message.id) };
+    case "outcome:appendEvent":
+    case "outcome:create":
+      return { ok: true, opportunity: await appendOutcomeEvent(message.opportunityId, message.event || message.outcomeEvent || {}) };
+    case "outcome:voidEvent":
+    case "outcome:delete":
+      return { ok: true, opportunity: await voidOutcomeEvent(message.id, message.reason || "") };
+    case "outcome:listEvents":
+    case "outcome:list":
+      return { ok: true, outcomeEvents: await listOutcomeEvents(message.opportunityId, { includeVoided: Boolean(message.includeVoided) }) };
+    case "outcome:getSummary":
+      return { ok: true, outcomeSummary: await getOutcomeSummary(message.opportunityId) };
     default:
       throw new Error(`Unknown message type: ${message?.type || "empty"}`);
   }
@@ -559,6 +574,25 @@ function normalizeStringList(value) {
     .filter(Boolean);
 }
 
+function normalizeIsoTime(value, fieldName) {
+  const text = normalizeText(value);
+  const time = Date.parse(text);
+  if (!text || Number.isNaN(time)) throw new Error(`${fieldName} must be a valid ISO date`);
+  return new Date(time).toISOString();
+}
+
+function normalizeNullableNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) throw new Error("Outcome numeric payload field is invalid");
+  return number;
+}
+
+function normalizeBidType(value) {
+  const text = normalizeText(value || "unknown");
+  return ["fixed", "hourly", "unknown"].includes(text) ? text : "unknown";
+}
+
 async function getStorageUsage() {
   const bytesInUse = await chrome.storage.local.getBytesInUse(null);
   return {
@@ -685,6 +719,7 @@ async function listOpportunitySummaries({ includeArchived = false } = {}) {
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
     .map((opportunity) => {
       const score = store.scoreResults.find((item) => item.id === opportunity.currentScoreResultId) || null;
+      const outcomeSummary = deriveOutcomeSummary(opportunity.id, store.outcomeEvents);
       return {
         id: opportunity.id,
         schemaVersion: opportunity.schemaVersion,
@@ -696,6 +731,7 @@ async function listOpportunitySummaries({ includeArchived = false } = {}) {
         updatedAt: opportunity.updatedAt,
         archivedAt: opportunity.archivedAt,
         snapshotCount: opportunity.snapshotIds.length,
+        outcomeSummary,
         currentScore: score ? {
           id: score.id,
           totalScore: score.totalScore,
@@ -762,6 +798,7 @@ async function deleteOpportunityPermanent(id) {
     store.scoreResults = store.scoreResults.filter((item) => item.opportunityId !== id);
     store.noteRevisions = store.noteRevisions.filter((item) => item.opportunityId !== id);
     store.proposalDrafts = store.proposalDrafts.filter((item) => item.opportunityId !== id);
+    store.outcomeEvents = store.outcomeEvents.filter((item) => item.opportunityId !== id);
     await writeStore(store);
   });
 }
@@ -1107,6 +1144,8 @@ async function captureCurrentPage(opportunityId) {
     opportunity.snapshotIds.push(snapshot.id);
     opportunity.updatedAt = capturedAt;
     store.snapshots.push(snapshot);
+    const detectedOutcomeEvent = createCaptureOutcomeEvent({ opportunity, snapshot, text: result.text, capturedAt });
+    if (detectedOutcomeEvent) store.outcomeEvents.push(detectedOutcomeEvent);
     await writeStore(store);
 
     return { ok: true, opportunity: hydrateOpportunity(opportunity, store), snapshot: toLegacySnapshot(snapshot) };
@@ -1170,6 +1209,52 @@ function captureVisibleDom(maxChars) {
       hiddenNodes
     }
   };
+}
+
+function createCaptureOutcomeEvent({ opportunity, snapshot, text, capturedAt }) {
+  const detected = detectOutcomeStatusFromCapture(snapshot.sourceUrl, text);
+  if (!detected) return null;
+  return {
+    id: crypto.randomUUID(),
+    opportunityId: opportunity.id,
+    schemaVersion: SCHEMA_VERSION,
+    eventType: OUTCOME_EVENT_TYPE.captureDetectedStatus,
+    occurredAt: capturedAt,
+    recordedAt: capturedAt,
+    source: "capture",
+    snapshotId: snapshot.id,
+    payload: {
+      detectedStatus: detected.status,
+      confidence: detected.confidence,
+      evidenceRefs: [{
+        sourceType: "snapshot_evidence",
+        sourceId: snapshot.id,
+        fieldKey: "text",
+        label: detected.label,
+        quote: detected.quote
+      }]
+    },
+    notes: "",
+    correctionOfEventId: null,
+    voidedAt: null
+  };
+}
+
+function detectOutcomeStatusFromCapture(url, text) {
+  const corpus = `${url || ""}\n${text || ""}`.toLowerCase();
+  const rules = [
+    { status: OUTCOME_STATUS.hired, label: "Detected hired status", patterns: ["contract started", "you were hired", "offer accepted"] },
+    { status: OUTCOME_STATUS.interviewing, label: "Detected interview status", patterns: ["interview invitation", "invite to interview", "interview started"] },
+    { status: OUTCOME_STATUS.replied, label: "Detected client reply", patterns: ["client replied", "new message from the client", "messages with client"] },
+    { status: OUTCOME_STATUS.viewed, label: "Detected proposal viewed", patterns: ["client viewed your proposal", "proposal viewed"] },
+    { status: OUTCOME_STATUS.applied, label: "Detected proposal sent", patterns: ["you submitted a proposal", "proposal submitted", "your proposal was sent"] },
+    { status: OUTCOME_STATUS.lost, label: "Detected lost status", patterns: ["job closed", "not selected", "contract ended without hire"] }
+  ];
+  for (const rule of rules) {
+    const quote = rule.patterns.find((pattern) => corpus.includes(pattern));
+    if (quote) return { status: rule.status, confidence: 0.8, label: rule.label, quote };
+  }
+  return null;
 }
 
 async function readPersonalContext() {
@@ -1474,6 +1559,202 @@ async function archiveProposalDraft(id) {
     await writeStore(store);
     return hydrateOpportunity(store.opportunities[opportunityIndex], store);
   });
+}
+
+async function appendOutcomeEvent(opportunityId, eventInput = {}) {
+  if (!opportunityId) throw new Error("Opportunity id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.opportunities.findIndex((item) => item.id === opportunityId);
+    if (index === -1) throw new Error("Opportunity not found");
+    const event = normalizeOutcomeEventInput(eventInput, {
+      opportunity: store.opportunities[index],
+      proposalDrafts: store.proposalDrafts,
+      outcomeEvents: store.outcomeEvents
+    });
+    store.outcomeEvents.push(event);
+    store.opportunities[index] = {
+      ...store.opportunities[index],
+      updatedAt: event.recordedAt
+    };
+    await writeStore(store);
+    return hydrateOpportunity(store.opportunities[index], store);
+  });
+}
+
+async function voidOutcomeEvent(id, reason = "") {
+  if (!id) throw new Error("Outcome event id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const eventIndex = store.outcomeEvents.findIndex((item) => item.id === id);
+    if (eventIndex === -1) throw new Error("Outcome event not found");
+    const event = store.outcomeEvents[eventIndex];
+    if (event.voidedAt) throw new Error("Outcome event is already voided");
+    const opportunityIndex = store.opportunities.findIndex((item) => item.id === event.opportunityId);
+    if (opportunityIndex === -1) throw new Error("Opportunity not found");
+    const now = new Date().toISOString();
+    store.outcomeEvents[eventIndex] = {
+      ...event,
+      notes: reason ? `${event.notes || ""}\n[Voided reason] ${reason}`.trim() : event.notes || "",
+      voidedAt: now
+    };
+    store.opportunities[opportunityIndex] = {
+      ...store.opportunities[opportunityIndex],
+      updatedAt: now
+    };
+    await writeStore(store);
+    return hydrateOpportunity(store.opportunities[opportunityIndex], store);
+  });
+}
+
+async function listOutcomeEvents(opportunityId, { includeVoided = false } = {}) {
+  if (!opportunityId) throw new Error("Opportunity id is required");
+  const store = await readStore();
+  return getOutcomeEventsForOpportunity(opportunityId, store.outcomeEvents, { includeVoided });
+}
+
+async function getOutcomeSummary(opportunityId) {
+  if (!opportunityId) throw new Error("Opportunity id is required");
+  const store = await readStore();
+  const opportunity = store.opportunities.find((item) => item.id === opportunityId);
+  if (!opportunity) throw new Error("Opportunity not found");
+  return deriveOutcomeSummary(opportunityId, store.outcomeEvents);
+}
+
+function normalizeOutcomeEventInput(input, { opportunity, proposalDrafts, outcomeEvents }) {
+  const now = new Date().toISOString();
+  const eventType = normalizeText(input.eventType || input.event_type);
+  if (!OUTCOME_EVENT_TYPES.includes(eventType)) throw new Error(`Unsupported outcome event type: ${eventType || "(missing)"}`);
+  if (eventType === OUTCOME_EVENT_TYPE.captureDetectedStatus) throw new Error("Capture detected outcome events must be created by capture");
+  if (eventType === OUTCOME_EVENT_TYPE.voided) throw new Error("Use outcome:voidEvent to void an outcome event");
+  const occurredAt = normalizeIsoTime(input.occurredAt || input.occurred_at || now, "occurredAt");
+  const recordedAt = now;
+  const payload = normalizeOutcomePayload(eventType, input.payload || {}, {
+    opportunity,
+    proposalDrafts,
+    outcomeEvents
+  });
+  return {
+    id: input.id || crypto.randomUUID(),
+    opportunityId: opportunity.id,
+    schemaVersion: SCHEMA_VERSION,
+    eventType,
+    occurredAt,
+    recordedAt,
+    source: "manual",
+    snapshotId: normalizeText(input.snapshotId || input.snapshot_id) || null,
+    payload,
+    notes: normalizeText(input.notes),
+    correctionOfEventId: normalizeText(input.correctionOfEventId || input.correction_of_event_id) || null,
+    voidedAt: null
+  };
+}
+
+function normalizeOutcomePayload(eventType, payload, { opportunity, proposalDrafts, outcomeEvents }) {
+  if (eventType === OUTCOME_EVENT_TYPE.proposalSent) {
+    const proposalDraftId = normalizeText(payload.proposalDraftId || payload.proposal_draft_id || opportunity.currentProposalDraftId);
+    if (proposalDraftId && !proposalDrafts.some((item) => item.id === proposalDraftId && item.opportunityId === opportunity.id)) {
+      throw new Error("Outcome proposal_sent references missing ProposalDraft");
+    }
+    return {
+      connectsSpent: normalizeNullableNumber(payload.connectsSpent ?? payload.connects_spent),
+      bidAmount: normalizeNullableNumber(payload.bidAmount ?? payload.bid_amount),
+      bidCurrency: normalizeText(payload.bidCurrency || payload.bid_currency || "USD"),
+      bidType: normalizeBidType(payload.bidType || payload.bid_type),
+      proposalDraftId: proposalDraftId || null,
+      proposalTextRevisionId: normalizeText(payload.proposalTextRevisionId || payload.proposal_text_revision_id) || null
+    };
+  }
+  if (eventType === OUTCOME_EVENT_TYPE.correction) {
+    const correctedEventId = normalizeText(payload.correctedEventId || payload.corrected_event_id);
+    if (!correctedEventId || !outcomeEvents.some((item) => item.id === correctedEventId && item.opportunityId === opportunity.id)) {
+      throw new Error("Outcome correction references missing event");
+    }
+    return {
+      correctedEventId,
+      correctedFields: isPlainObject(payload.correctedFields || payload.corrected_fields) ? (payload.correctedFields || payload.corrected_fields) : {},
+      reason: normalizeText(payload.reason)
+    };
+  }
+  return isPlainObject(payload) ? payload : {};
+}
+
+function getOutcomeEventsForOpportunity(opportunityId, events, { includeVoided = false } = {}) {
+  return (events || [])
+    .filter((item) => item.opportunityId === opportunityId)
+    .filter((item) => includeVoided || !item.voidedAt)
+    .sort(compareOutcomeEvents);
+}
+
+function deriveOutcomeSummary(opportunityId, events = []) {
+  const activeEvents = getOutcomeEventsForOpportunity(opportunityId, events);
+  const summary = {
+    opportunityId,
+    status: OUTCOME_STATUS.notApplied,
+    appliedAt: null,
+    viewedAt: null,
+    repliedAt: null,
+    interviewAt: null,
+    hiredAt: null,
+    lostAt: null,
+    connectsSpent: null,
+    bidAmount: null,
+    bidCurrency: "",
+    bidType: "",
+    derivedFromEventIds: [],
+    updatedAt: null
+  };
+
+  for (const event of activeEvents) {
+    summary.derivedFromEventIds.push(event.id);
+    summary.updatedAt = event.recordedAt || summary.updatedAt;
+    const eventStatus = statusFromOutcomeEvent(event);
+    if (eventStatus) {
+      applyOutcomeStatus(summary, eventStatus, event.occurredAt);
+      summary.status = eventStatus;
+    }
+    if (event.eventType === OUTCOME_EVENT_TYPE.proposalSent) {
+      summary.connectsSpent = event.payload?.connectsSpent ?? summary.connectsSpent;
+      summary.bidAmount = event.payload?.bidAmount ?? summary.bidAmount;
+      summary.bidCurrency = event.payload?.bidCurrency || summary.bidCurrency;
+      summary.bidType = event.payload?.bidType || summary.bidType;
+    }
+  }
+
+  return summary;
+}
+
+function statusFromOutcomeEvent(event) {
+  if (event.eventType === OUTCOME_EVENT_TYPE.markedNotApplied) return OUTCOME_STATUS.notApplied;
+  if (event.eventType === OUTCOME_EVENT_TYPE.markedSkipped) return OUTCOME_STATUS.skipped;
+  if (event.eventType === OUTCOME_EVENT_TYPE.proposalSent) return OUTCOME_STATUS.applied;
+  if (event.eventType === OUTCOME_EVENT_TYPE.proposalViewed) return OUTCOME_STATUS.viewed;
+  if (event.eventType === OUTCOME_EVENT_TYPE.clientReplied) return OUTCOME_STATUS.replied;
+  if (event.eventType === OUTCOME_EVENT_TYPE.interviewStarted) return OUTCOME_STATUS.interviewing;
+  if (event.eventType === OUTCOME_EVENT_TYPE.hired) return OUTCOME_STATUS.hired;
+  if (event.eventType === OUTCOME_EVENT_TYPE.lost) return OUTCOME_STATUS.lost;
+  if (event.eventType === OUTCOME_EVENT_TYPE.captureDetectedStatus) {
+    const detectedStatus = normalizeText(event.payload?.detectedStatus || event.payload?.detected_status);
+    return OUTCOME_STATUSES.includes(detectedStatus) ? detectedStatus : null;
+  }
+  return null;
+}
+
+function applyOutcomeStatus(summary, status, occurredAt) {
+  if ([OUTCOME_STATUS.applied, OUTCOME_STATUS.viewed, OUTCOME_STATUS.replied, OUTCOME_STATUS.interviewing, OUTCOME_STATUS.hired, OUTCOME_STATUS.lost].includes(status)) {
+    summary.appliedAt = summary.appliedAt || occurredAt;
+  }
+  if (status === OUTCOME_STATUS.viewed) summary.viewedAt = summary.viewedAt || occurredAt;
+  if (status === OUTCOME_STATUS.replied) summary.repliedAt = summary.repliedAt || occurredAt;
+  if (status === OUTCOME_STATUS.interviewing) summary.interviewAt = summary.interviewAt || occurredAt;
+  if (status === OUTCOME_STATUS.hired) summary.hiredAt = occurredAt;
+  if (status === OUTCOME_STATUS.lost) summary.lostAt = occurredAt;
+}
+
+function compareOutcomeEvents(left, right) {
+  const occurredDelta = new Date(left.occurredAt || left.recordedAt) - new Date(right.occurredAt || right.recordedAt);
+  if (occurredDelta !== 0) return occurredDelta;
+  return new Date(left.recordedAt) - new Date(right.recordedAt);
 }
 
 function arraysEqual(left, right) {
@@ -1958,6 +2239,8 @@ function hydrateOpportunity(opportunity, store) {
   const score = store.scoreResults.find((item) => item.id === opportunity.currentScoreResultId) || null;
   const profile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
   const proposalDraft = store.proposalDrafts.find((item) => item.id === opportunity.currentProposalDraftId) || null;
+  const outcomeEvents = getOutcomeEventsForOpportunity(opportunity.id, store.outcomeEvents, { includeVoided: true });
+  const outcomeSummary = deriveOutcomeSummary(opportunity.id, store.outcomeEvents);
   const notes = getCurrentNotesText(opportunity, store.noteRevisions);
   const scoreStale = Boolean(score && (score.notesRevisionId || null) !== (opportunity.currentNotesRevisionId || null));
   const proposalStale = Boolean(proposalDraft && (
@@ -1978,6 +2261,8 @@ function hydrateOpportunity(opportunity, store) {
     scoreResult: score ? toLegacyScoreResult(score, { scoreStale }) : null,
     proposalStale,
     proposalDraft,
+    outcomeSummary,
+    outcomeEvents,
     snapshotCount: snapshots.length,
     currentScore: score ? {
       id: score.id,
@@ -2175,7 +2460,8 @@ async function readStore() {
     STORAGE_KEYS.opportunityProfiles,
     STORAGE_KEYS.scoreResults,
     STORAGE_KEYS.noteRevisions,
-    STORAGE_KEYS.proposalDrafts
+    STORAGE_KEYS.proposalDrafts,
+    STORAGE_KEYS.outcomeEvents
   ]);
   return {
     meta: data[STORAGE_KEYS.meta] || null,
@@ -2184,7 +2470,8 @@ async function readStore() {
     opportunityProfiles: data[STORAGE_KEYS.opportunityProfiles] || [],
     scoreResults: data[STORAGE_KEYS.scoreResults] || [],
     noteRevisions: data[STORAGE_KEYS.noteRevisions] || [],
-    proposalDrafts: data[STORAGE_KEYS.proposalDrafts] || []
+    proposalDrafts: data[STORAGE_KEYS.proposalDrafts] || [],
+    outcomeEvents: data[STORAGE_KEYS.outcomeEvents] || []
   };
 }
 
@@ -2195,7 +2482,8 @@ async function writeStore(store) {
     [STORAGE_KEYS.opportunityProfiles]: store.opportunityProfiles,
     [STORAGE_KEYS.scoreResults]: store.scoreResults,
     [STORAGE_KEYS.noteRevisions]: store.noteRevisions,
-    [STORAGE_KEYS.proposalDrafts]: store.proposalDrafts || []
+    [STORAGE_KEYS.proposalDrafts]: store.proposalDrafts || [],
+    [STORAGE_KEYS.outcomeEvents]: store.outcomeEvents || []
   });
   await bumpStorageRevision();
 }
@@ -2280,6 +2568,7 @@ function validateImportData(importPayload) {
   const myProfile = data[STORAGE_KEYS.myProfile] ?? null;
   const portfolioCases = requireArray(data[STORAGE_KEYS.portfolioCases] || [], STORAGE_KEYS.portfolioCases);
   const proposalDrafts = requireArray(data[STORAGE_KEYS.proposalDrafts] || [], STORAGE_KEYS.proposalDrafts);
+  const outcomeEvents = requireArray(data[STORAGE_KEYS.outcomeEvents] || [], STORAGE_KEYS.outcomeEvents);
   validateEntityShape(opportunities, IMPORT_ENTITY_SCHEMAS.opportunity);
   validateEntityShape(snapshots, IMPORT_ENTITY_SCHEMAS.snapshot);
   validateEntityShape(profiles, IMPORT_ENTITY_SCHEMAS.opportunityProfile);
@@ -2288,7 +2577,8 @@ function validateImportData(importPayload) {
   validateOptionalEntityShape(myProfile, IMPORT_ENTITY_SCHEMAS.myProfile);
   validateEntityShape(portfolioCases, IMPORT_ENTITY_SCHEMAS.portfolioCase);
   validateEntityShape(proposalDrafts, IMPORT_ENTITY_SCHEMAS.proposalDraft);
-  validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts });
+  validateEntityShape(outcomeEvents, IMPORT_ENTITY_SCHEMAS.outcomeEvent);
+  validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents });
 
   return {
     schemaVersion: manifest.schemaVersion,
@@ -2300,7 +2590,8 @@ function validateImportData(importPayload) {
       noteRevisions: notes.length,
       myProfile: myProfile ? 1 : 0,
       portfolioCases: portfolioCases.length,
-      proposalDrafts: proposalDrafts.length
+      proposalDrafts: proposalDrafts.length,
+      outcomeEvents: outcomeEvents.length
     }
   };
 }
@@ -2345,6 +2636,11 @@ const IMPORT_ENTITY_SCHEMAS = Object.freeze({
     name: "ProposalDraft",
     required: ["id", "opportunityId", "schemaVersion", "createdAt", "updatedAt", "status", "templateId", "model", "promptVersion", "inputScoreResultId", "selectedPortfolioCaseRefs", "assumptions", "unsupportedClaims", "questionsToAsk", "openingLine", "fitSummary", "relevantProof", "scopeBoundary", "suggestedRateOrBid", "finalText", "sourceRefs", "revisions"],
     allowed: ["id", "opportunityId", "schemaVersion", "createdAt", "updatedAt", "status", "templateId", "model", "promptVersion", "inputProfileId", "inputProfileVersion", "inputScoreResultId", "inputMyProfileId", "inputMyProfileVersion", "selectedPortfolioCaseRefs", "assumptions", "unsupportedClaims", "questionsToAsk", "openingLine", "fitSummary", "relevantProof", "scopeBoundary", "suggestedRateOrBid", "finalText", "sourceRefs", "revisions", "archivedAt"]
+  },
+  outcomeEvent: {
+    name: "OutcomeEvent",
+    required: ["id", "opportunityId", "schemaVersion", "eventType", "occurredAt", "recordedAt", "source", "payload", "notes"],
+    allowed: ["id", "opportunityId", "schemaVersion", "eventType", "occurredAt", "recordedAt", "source", "snapshotId", "payload", "notes", "correctionOfEventId", "voidedAt"]
   }
 });
 
@@ -2451,7 +2747,7 @@ function requireArray(value, name) {
   return value;
 }
 
-function validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts }) {
+function validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents }) {
   const opportunityIds = new Set(opportunities.map((item) => item.id));
   const snapshotIds = new Set(snapshots.map((item) => item.id));
   const profileIds = new Set(profiles.map((item) => item.id));
@@ -2459,6 +2755,7 @@ function validateReferences({ opportunities, snapshots, profiles, scores, notes,
   const noteIds = new Set(notes.map((item) => item.id));
   const portfolioCaseIds = new Set(portfolioCases.map((item) => item.id));
   const proposalDraftIds = new Set(proposalDrafts.map((item) => item.id));
+  const outcomeEventIds = new Set(outcomeEvents.map((item) => item.id));
   for (const opportunity of opportunities) {
     for (const snapshotId of opportunity.snapshotIds || []) {
       if (!snapshotIds.has(snapshotId)) throw new Error(`Opportunity ${opportunity.id} references missing snapshot`);
@@ -2499,6 +2796,22 @@ function validateReferences({ opportunities, snapshots, profiles, scores, notes,
       myProfileId: draft.inputMyProfileId || null,
       portfolioCaseIds: new Set((draft.selectedPortfolioCaseRefs || []).map((item) => item.id))
     });
+  }
+  for (const event of outcomeEvents) {
+    if (!OUTCOME_EVENT_TYPES.includes(event.eventType)) throw new Error(`OutcomeEvent ${event.id} has unsupported eventType`);
+    if (!OUTCOME_EVENT_SOURCES.includes(event.source)) throw new Error(`OutcomeEvent ${event.id} has unsupported source`);
+    if (!opportunityIds.has(event.opportunityId)) throw new Error(`OutcomeEvent ${event.id} references missing opportunity`);
+    if (event.snapshotId && !snapshotIds.has(event.snapshotId)) throw new Error(`OutcomeEvent ${event.id} references missing snapshot`);
+    if (event.correctionOfEventId && !outcomeEventIds.has(event.correctionOfEventId)) throw new Error(`OutcomeEvent ${event.id} references missing corrected event`);
+    if (event.eventType === OUTCOME_EVENT_TYPE.proposalSent) {
+      const proposalDraftId = event.payload?.proposalDraftId || event.payload?.proposal_draft_id;
+      if (proposalDraftId && !proposalDraftIds.has(proposalDraftId)) throw new Error(`OutcomeEvent ${event.id} references missing ProposalDraft`);
+      if (proposalDraftId && proposalDrafts.find((item) => item.id === proposalDraftId)?.opportunityId !== event.opportunityId) throw new Error(`OutcomeEvent ${event.id} references ProposalDraft from another opportunity`);
+    }
+    if (event.eventType === OUTCOME_EVENT_TYPE.captureDetectedStatus) {
+      const detectedStatus = event.payload?.detectedStatus || event.payload?.detected_status;
+      if (!OUTCOME_STATUSES.includes(detectedStatus)) throw new Error(`OutcomeEvent ${event.id} has unsupported detectedStatus`);
+    }
   }
 }
 

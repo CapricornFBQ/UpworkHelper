@@ -229,6 +229,10 @@ label {
   margin-top: 12px;
 }
 
+.compact-label {
+  margin-top: 10px;
+}
+
 .profile-field small {
   color: var(--muted);
   font-weight: 400;
@@ -315,6 +319,11 @@ label {
 .snapshot small,
 .dimension small {
   color: var(--muted);
+}
+
+.snapshot.voided {
+  opacity: 0.65;
+  text-decoration: line-through;
 }
 
 .dimension header {
