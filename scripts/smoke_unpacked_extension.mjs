@@ -4,12 +4,19 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  DEFAULT_SETTINGS,
+  OPPORTUNITY_STATUS,
+  SCHEMA_VERSION,
+  STORAGE_KEYS
+} from "../src/shared/schema.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const chromePath = findChrome();
 const port = Number(process.env.UOSC_CDP_PORT || 47000 + Math.floor(Math.random() * 1000));
 const userDataDir = mkdtempSync(join(tmpdir(), "uosc-extension-smoke-"));
 const headless = process.env.UOSC_SMOKE_HEADLESS !== "0";
+const smokeOpportunityId = "opp_smoke_notes_failure";
 let chromeProcess = null;
 let client = null;
 
@@ -34,10 +41,7 @@ async function main() {
       title: "Upwork Scorer",
       selectors: ["#captureButton", "#opportunitySelect"]
     });
-    await smokeStaticExtensionPage(extensionId, "src/sidepanel/sidepanel.html", {
-      title: "Opportunity",
-      selectors: ["#captureButton", "#scoreButton", "#deleteButton", "#permanentDeleteButton", "#saveNotesButton"]
-    });
+    await smokeSidePanelPage(extensionId);
 
     console.log(`unpacked extension smoke passed: ${extensionId}`);
   } finally {
@@ -116,6 +120,95 @@ async function smokeStaticExtensionPage(extensionId, pagePath, expected) {
   const page = await openExtensionPage(extensionId, pagePath);
   assert.equal(await evaluate(page.sessionId, "document.title"), expected.title);
   assert.equal(await hasSelectors(page.sessionId, expected.selectors), true);
+}
+
+async function smokeSidePanelPage(extensionId) {
+  const page = await openExtensionPage(extensionId, "src/sidepanel/sidepanel.html");
+  assert.equal(await evaluate(page.sessionId, "document.title"), "Opportunity");
+  assert.equal(await hasSelectors(page.sessionId, [
+    "#captureButton",
+    "#scoreButton",
+    "#deleteButton",
+    "#permanentDeleteButton",
+    "#refreshButton",
+    "#notesInput",
+    "#saveNotesButton",
+    "#panelStatus"
+  ]), true);
+
+  await seedSmokeOpportunity(page.sessionId);
+  await evaluate(page.sessionId, `document.querySelector("#refreshButton").click()`);
+  await waitUntil(async () => {
+    return evaluate(page.sessionId, `
+      document.querySelector("#opportunitySelect").value === ${JSON.stringify(smokeOpportunityId)} &&
+      document.querySelector("#notesInput").value === "" &&
+      !document.querySelector("#saveNotesButton").disabled
+    `);
+  });
+
+  await evaluate(page.sessionId, `
+    chrome.storage.local.set(${JSON.stringify({ [STORAGE_KEYS.opportunities]: [] })})
+  `);
+  await evaluate(page.sessionId, `
+    document.querySelector("#notesInput").value = "note written during smoke failure";
+    document.querySelector("#saveNotesButton").click();
+  `);
+  await waitUntil(async () => {
+    return evaluate(page.sessionId, `
+      document.querySelector("#panelStatus").textContent === "Opportunity not found" &&
+      !document.querySelector("#saveNotesButton").disabled
+    `);
+  });
+
+  const noteRevisionCount = await evaluate(page.sessionId, `
+    chrome.storage.local.get(${JSON.stringify(STORAGE_KEYS.noteRevisions)})
+      .then((data) => (data[${JSON.stringify(STORAGE_KEYS.noteRevisions)}] || []).length)
+  `);
+  assert.equal(noteRevisionCount, 0);
+}
+
+async function seedSmokeOpportunity(sessionId) {
+  const now = "2026-05-06T00:00:00.000Z";
+  await evaluate(sessionId, `
+    chrome.storage.local.set(${JSON.stringify({
+      [STORAGE_KEYS.meta]: {
+        schemaVersion: SCHEMA_VERSION,
+        storageRevision: 1,
+        migratedAt: now,
+        lastMigrationAt: now,
+        lastBackupAt: null,
+        lastBackupKey: null
+      },
+      [STORAGE_KEYS.settings]: { ...DEFAULT_SETTINGS, apiKey: "" },
+      [STORAGE_KEYS.opportunities]: [{
+        id: smokeOpportunityId,
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: now,
+        updatedAt: now,
+        title: "Smoke notes failure",
+        mainUrl: "https://www.upwork.com/jobs/details/smoke-notes-failure",
+        jobKey: "smoke-notes-failure",
+        platform: "upwork",
+        status: OPPORTUNITY_STATUS.captured,
+        snapshotIds: [],
+        currentProfileId: null,
+        currentScoreResultId: null,
+        currentNotesRevisionId: null,
+        archivedAt: null
+      }],
+      [STORAGE_KEYS.snapshots]: [],
+      [STORAGE_KEYS.opportunityProfiles]: [],
+      [STORAGE_KEYS.scoreResults]: [],
+      [STORAGE_KEYS.noteRevisions]: [],
+      [STORAGE_KEYS.myProfile]: null,
+      [STORAGE_KEYS.portfolioCases]: [],
+      [STORAGE_KEYS.proposalDrafts]: [],
+      [STORAGE_KEYS.outcomeEvents]: [],
+      [STORAGE_KEYS.clientRecords]: [],
+      [STORAGE_KEYS.fieldSelectors]: [],
+      [STORAGE_KEYS.analyticsCache]: {}
+    })})
+  `);
 }
 
 async function openExtensionPage(extensionId, pagePath) {
