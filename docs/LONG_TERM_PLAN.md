@@ -960,6 +960,7 @@ v0.9 Selector Assist
 7. ClientRecord 的 exact match 条件不够严格。
    - 状态：`[人工闭环已实现；exact 自动匹配未实现]`。
    - 修复建议：只有稳定 client URL/id 才能 exact 自动关联。客户名称、国家、评分、总花费只能进入 probable match，必须用户确认后合并。当前 v0.7 只允许用户手动创建/关联/合并/拆分，避免 probable match 自动污染。
+   - 当前 UI 提示：Client history 区域已提示优先使用稳定雇主主页 URL 或 client id 作为 Identity key；如果 job 页面暴露雇主主页链接，先用 Selector Assist 点选该链接，否则再手动输入。
 
 8. Proposal 的 unsupported claims 目前只靠 prompt 约束，不是可验证流程。
    - 修复建议：proposal 输出中的每条 proof/claim 必须带 `sourceRefs[]`，来源限定为 opportunity field、snapshot evidence、My Profile、Portfolio Case、Notes。`unsupportedClaims.length > 0` 时 UI 必须显示警告，复制按钮仍可用但必须让用户看见风险。
