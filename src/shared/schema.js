@@ -1,4 +1,4 @@
-export const PLAN_VERSION = "0.4.0";
+export const PLAN_VERSION = "0.5.0";
 export const SCHEMA_VERSION = 1;
 
 export const STORAGE_KEYS = Object.freeze({
@@ -46,6 +46,12 @@ export const SNAPSHOT_RETENTION_STATE = Object.freeze({
   redacted: "redacted",
   compacted: "compacted",
   deletedReferenceOnly: "deleted_reference_only"
+});
+
+export const PROPOSAL_DRAFT_STATUS = Object.freeze({
+  generated: "generated",
+  edited: "edited",
+  archived: "archived"
 });
 
 export const PROMPT_VERSIONS = Object.freeze({

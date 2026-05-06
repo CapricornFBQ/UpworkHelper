@@ -18,6 +18,8 @@ const userDataDir = mkdtempSync(join(tmpdir(), "uosc-extension-smoke-"));
 const headless = process.env.UOSC_SMOKE_HEADLESS !== "0";
 const smokeOpportunityId = "opp_smoke_notes_failure";
 const smokeProfileId = "profile_smoke_notes_failure";
+const smokeScoreId = "score_smoke_notes_failure";
+const smokeProposalId = "proposal_smoke_notes_failure";
 let chromeProcess = null;
 let client = null;
 
@@ -157,6 +159,12 @@ async function smokeSidePanelPage(extensionId) {
     "#extractProfileButton",
     "#saveProfileButton",
     "#clearProfileButton",
+    "#generateProposalButton",
+    "#saveProposalButton",
+    "#copyProposalButton",
+    "#archiveProposalButton",
+    "#proposalOutput",
+    "#proposalRiskPanel",
     "#profileFieldsPanel",
     "#profileConflictsPanel",
     "#panelStatus"
@@ -172,6 +180,8 @@ async function smokeSidePanelPage(extensionId) {
       document.querySelector('[data-profile-field="jobTitle"]').value === "Corrected smoke title" &&
       document.querySelector("#profileConflictsPanel").textContent.includes("AI extracted") &&
       document.querySelector("#profileConflictsPanel").textContent.includes("Corrected smoke title") &&
+      document.querySelector("#proposalOutput").value.includes("Smoke proposal text") &&
+      document.querySelector("#proposalRiskPanel").textContent.includes("Unsupported smoke claim") &&
       !document.querySelector("#saveNotesButton").disabled
     `);
   });
@@ -222,7 +232,8 @@ async function seedSmokeOpportunity(sessionId) {
         status: OPPORTUNITY_STATUS.captured,
         snapshotIds: [],
         currentProfileId: smokeProfileId,
-        currentScoreResultId: null,
+        currentScoreResultId: smokeScoreId,
+        currentProposalDraftId: smokeProposalId,
         currentNotesRevisionId: null,
         archivedAt: null
       }],
@@ -283,11 +294,80 @@ async function seedSmokeOpportunity(sessionId) {
         reviewedBy: "user",
         rawProfile: { title: "AI smoke title", missing_fields: [] }
       }],
-      [STORAGE_KEYS.scoreResults]: [],
+      [STORAGE_KEYS.scoreResults]: [{
+        id: smokeScoreId,
+        opportunityId: smokeOpportunityId,
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: now,
+        model: "smoke-model",
+        promptVersion: "score_prompt_v1",
+        scoreVersion: "score_rules_v1",
+        inputSnapshotIds: [],
+        inputProfileId: smokeProfileId,
+        inputProfileVersion: 1,
+        notesRevisionId: null,
+        profileReviewed: true,
+        inputMyProfileId: null,
+        inputMyProfileVersion: null,
+        inputPortfolioCaseRefs: [],
+        totalScore: 81,
+        decision: "targeted_apply",
+        decisionSummary: "Smoke score summary",
+        timingPriority: "normal",
+        dimensions: [],
+        hardRedFlags: [],
+        risks: [],
+        missingInfoChecklist: [],
+        recommendedBidStrategy: "Smoke bid strategy",
+        proposalAngle: "Smoke proposal angle",
+        confidence: 0.8,
+        archivedAt: null,
+        rawResult: {
+          total_score: 81,
+          decision: "targeted_apply",
+          decision_summary: "Smoke score summary",
+          timing_priority: "normal",
+          dimensions: [],
+          hard_red_flags: [],
+          risks: [],
+          missing_info_checklist: [],
+          recommended_bid_strategy: "Smoke bid strategy",
+          proposal_angle: "Smoke proposal angle",
+          confidence: 0.8
+        }
+      }],
       [STORAGE_KEYS.noteRevisions]: [],
       [STORAGE_KEYS.myProfile]: null,
       [STORAGE_KEYS.portfolioCases]: [],
-      [STORAGE_KEYS.proposalDrafts]: [],
+      [STORAGE_KEYS.proposalDrafts]: [{
+        id: smokeProposalId,
+        opportunityId: smokeOpportunityId,
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: now,
+        updatedAt: now,
+        status: "generated",
+        templateId: "default_direct_proof_v1",
+        model: "smoke-model",
+        promptVersion: "proposal_prompt_v1",
+        inputProfileId: smokeProfileId,
+        inputProfileVersion: 1,
+        inputScoreResultId: smokeScoreId,
+        inputMyProfileId: null,
+        inputMyProfileVersion: null,
+        selectedPortfolioCaseRefs: [],
+        assumptions: [],
+        unsupportedClaims: [{ claim: "Unsupported smoke claim", reason: "No source saved", sourceRefs: [] }],
+        questionsToAsk: ["Smoke question"],
+        openingLine: "Smoke opening",
+        fitSummary: "Smoke fit",
+        relevantProof: [],
+        scopeBoundary: "Smoke scope",
+        suggestedRateOrBid: { text: "", sourceRefs: [] },
+        finalText: "Smoke proposal text",
+        sourceRefs: [],
+        revisions: [],
+        archivedAt: null
+      }],
       [STORAGE_KEYS.outcomeEvents]: [],
       [STORAGE_KEYS.clientRecords]: [],
       [STORAGE_KEYS.fieldSelectors]: [],

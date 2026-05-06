@@ -60,6 +60,25 @@
         <h2>Score details</h2>
         <div id="detailsPanel" class="details empty">No score yet.</div>
       </section>
+
+      <section class="panel">
+        <div class="section-header">
+          <h2>Proposal draft</h2>
+          <span id="proposalBadge" class="badge">No draft</span>
+        </div>
+        <div class="button-row">
+          <button id="generateProposalButton" class="primary">Generate proposal</button>
+          <button id="saveProposalButton">Save edit</button>
+          <button id="copyProposalButton">Copy text</button>
+          <button id="archiveProposalButton" class="danger">Archive draft</button>
+        </div>
+        <div id="proposalRiskPanel" class="list empty">No unsupported claims.</div>
+        <label for="proposalOutput" class="proposal-output-label">
+          Draft text
+          <textarea id="proposalOutput" rows="12" placeholder="Generate a proposal after scoring."></textarea>
+        </label>
+        <div id="proposalDetailsPanel" class="details empty">No proposal metadata.</div>
+      </section>
     </main>
 
     <script type="module" src="./sidepanel.js"></script>

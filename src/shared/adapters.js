@@ -115,12 +115,97 @@ export function normalizeRawScore(rawScore = {}) {
   };
 }
 
+export function normalizeRawProposalDraft(rawDraft = {}) {
+  const openingLine = normalizeText(rawDraft.openingLine ?? rawDraft.opening_line);
+  const fitSummary = normalizeText(rawDraft.fitSummary ?? rawDraft.fit_summary);
+  const relevantProof = normalizeProposalProofList(rawDraft.relevantProof ?? rawDraft.relevant_proof);
+  const scopeBoundary = normalizeText(rawDraft.scopeBoundary ?? rawDraft.scope_boundary);
+  const suggestedRateOrBid = normalizeProposalBlock(rawDraft.suggestedRateOrBid ?? rawDraft.suggested_rate_or_bid);
+  const finalText = normalizeText(
+    rawDraft.finalText ??
+    rawDraft.final_proposal_text ??
+    rawDraft.finalProposalText ??
+    [
+      openingLine,
+      fitSummary,
+      ...relevantProof.map((item) => item.text),
+      scopeBoundary,
+      suggestedRateOrBid.text
+    ].filter(Boolean).join("\n\n")
+  );
+
+  return {
+    assumptions: normalizeTextList(rawDraft.assumptions),
+    unsupportedClaims: normalizeUnsupportedClaims(rawDraft.unsupportedClaims ?? rawDraft.unsupported_claims),
+    questionsToAsk: normalizeTextList(rawDraft.questionsToAsk ?? rawDraft.questions_to_ask),
+    openingLine,
+    fitSummary,
+    relevantProof,
+    scopeBoundary,
+    suggestedRateOrBid,
+    finalText,
+    sourceRefs: normalizeSourceRefs(rawDraft.sourceRefs ?? rawDraft.source_refs)
+  };
+}
+
 export function normalizeDimensions(dimensions) {
   return dimensions.map((dimension) => ({
     ...dimension,
     score: clampNumber(dimension.score, 0, dimension.max_score || dimension.maxScore || 100),
     confidence: clampNumber(dimension.confidence, 0, 1)
   }));
+}
+
+function normalizeProposalProofList(value) {
+  const items = Array.isArray(value) ? value : [];
+  return items.map((item) => normalizeProposalBlock(item)).filter((item) => item.text || item.sourceRefs.length);
+}
+
+function normalizeProposalBlock(value = {}) {
+  if (typeof value === "string") {
+    return { text: normalizeText(value), sourceRefs: [] };
+  }
+  return {
+    text: normalizeText(value?.text ?? value?.value),
+    sourceRefs: normalizeSourceRefs(value?.sourceRefs ?? value?.source_refs)
+  };
+}
+
+function normalizeUnsupportedClaims(value) {
+  const items = Array.isArray(value) ? value : [];
+  return items.map((item) => {
+    if (typeof item === "string") {
+      return { claim: normalizeText(item), reason: "", sourceRefs: [] };
+    }
+    return {
+      claim: normalizeText(item?.claim ?? item?.text),
+      reason: normalizeText(item?.reason),
+      sourceRefs: normalizeSourceRefs(item?.sourceRefs ?? item?.source_refs)
+    };
+  }).filter((item) => item.claim || item.reason || item.sourceRefs.length);
+}
+
+function normalizeSourceRefs(value) {
+  const items = Array.isArray(value) ? value : [];
+  return items.map((item) => ({
+    sourceType: normalizeText(item?.sourceType ?? item?.source_type),
+    sourceId: normalizeText(item?.sourceId ?? item?.source_id),
+    fieldKey: normalizeText(item?.fieldKey ?? item?.field_key),
+    label: normalizeText(item?.label),
+    quote: normalizeText(item?.quote)
+  })).filter((item) => item.sourceType || item.sourceId || item.fieldKey || item.label || item.quote);
+}
+
+function normalizeTextList(value) {
+  if (Array.isArray(value)) return value.map((item) => normalizeText(item)).filter(Boolean);
+  return normalizeText(value)
+    .split(/\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeText(value) {
+  return String(value || "").trim();
 }
 
 function clampNumber(value, min, max) {

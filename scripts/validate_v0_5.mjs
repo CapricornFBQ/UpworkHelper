@@ -6,6 +6,7 @@ import {
   OPPORTUNITY_STATUS,
   PLAN_VERSION,
   PLATFORM_HOSTS,
+  PROPOSAL_DRAFT_STATUS,
   PROMPT_VERSIONS,
   SCHEMA_VERSION,
   SNAPSHOT_RETENTION_STATE,
@@ -16,6 +17,7 @@ import {
   buildEffectiveProfile,
   mapRawProfileFields,
   normalizeMissingProfileFieldKeys,
+  normalizeRawProposalDraft,
   normalizeRawScore,
   profileFieldsToLegacyRawProfile
 } from "../src/shared/adapters.js";
@@ -39,11 +41,14 @@ for (const file of jsFiles) {
 assert.equal(SCHEMA_VERSION, 1);
 assert.equal(DEFAULT_SETTINGS.captureMode, "strict_upwork");
 assert.equal(PLATFORM_HOSTS.upwork, "www.upwork.com");
-assert.equal(PLAN_VERSION, "0.4.0");
+assert.equal(PLAN_VERSION, "0.5.0");
 assert.equal(OPPORTUNITY_STATUS.draft, "draft");
 assert.equal(OPPORTUNITY_STATUS.captured, "captured");
+assert.equal(PROPOSAL_DRAFT_STATUS.generated, "generated");
+assert.equal(PROPOSAL_DRAFT_STATUS.edited, "edited");
 assert.equal(SNAPSHOT_RETENTION_STATE.deletedReferenceOnly, "deleted_reference_only");
 assert.equal(PROMPT_VERSIONS.scoreRuleVersion, "score_rules_v1");
+assert.equal(PROMPT_VERSIONS.proposalPromptVersion, "proposal_prompt_v1");
 assert.equal(STORAGE_KEYS.snapshots, "uosc_snapshots");
 assert.equal(STORAGE_KEYS.noteRevisions, "uosc_note_revisions");
 
@@ -82,6 +87,52 @@ const normalizedScore = normalizeRawScore(fakeScore);
 assert.equal(normalizedScore.total_score, 100);
 assert.equal(normalizedScore.confidence, 1);
 assert.equal(normalizedScore.dimensions[0].score, 15);
+
+const fakeProposal = {
+  assumptions: ["Client needs MV3 delivery"],
+  unsupported_claims: [{
+    claim: "24 hour delivery",
+    reason: "No saved availability supports this commitment",
+    source_refs: []
+  }],
+  questions_to_ask: ["Which Chrome stores are in scope?"],
+  opening_line: "Hi, I can help with this MV3 extension.",
+  fit_summary: "Your project matches my saved Chrome extension work.",
+  relevant_proof: [{
+    text: "I built a Chrome MV3 scoring extension.",
+    source_refs: [{
+      source_type: "portfolio_case",
+      source_id: "case_relevant",
+      field_key: "title",
+      label: "Relevant portfolio case",
+      quote: "MV3 scoring extension"
+    }]
+  }],
+  scope_boundary: "I would first confirm permissions, storage, and review flow.",
+  suggested_rate_or_bid: {
+    text: "Use the saved minimum project budget as the bid floor.",
+    source_refs: [{
+      source_type: "my_profile",
+      source_id: "my_profile_proposal",
+      field_key: "rateCard",
+      label: "Rate card",
+      quote: "$1000"
+    }]
+  },
+  final_proposal_text: "Hi, I can help with this MV3 extension.\n\nI built a Chrome MV3 scoring extension and would first confirm permissions, storage, and review flow.",
+  source_refs: [{
+    source_type: "score_result",
+    source_id: "score_proposal",
+    field_key: "proposalAngle",
+    label: "Score proposal angle",
+    quote: "Lead with extension experience"
+  }]
+};
+const normalizedProposal = normalizeRawProposalDraft(fakeProposal);
+assert.equal(normalizedProposal.questionsToAsk[0], "Which Chrome stores are in scope?");
+assert.equal(normalizedProposal.unsupportedClaims[0].claim, "24 hour delivery");
+assert.equal(normalizedProposal.relevantProof[0].sourceRefs[0].sourceType, "portfolio_case");
+assert.match(normalizedProposal.finalText, /MV3 extension/);
 
 const sourceFiles = [
   "manifest.json",
@@ -183,7 +234,7 @@ assert.equal(missingReferencePreview.ok, false);
 assert.match(missingReferencePreview.error, /references missing opportunity/);
 
 const unsupportedFutureEntity = structuredClone(validImportPayload);
-unsupportedFutureEntity.data[STORAGE_KEYS.proposalDrafts] = [{ id: "draft_1" }];
+unsupportedFutureEntity.data[STORAGE_KEYS.outcomeEvents] = [{ id: "event_1" }];
 const unsupportedFutureEntityPreview = await sendBackgroundMessage({ type: "data:importPreview", data: unsupportedFutureEntity });
 assert.equal(unsupportedFutureEntityPreview.ok, false);
 assert.match(unsupportedFutureEntityPreview.error, /import is not supported yet/);
@@ -229,9 +280,10 @@ await runNotesStaleTests();
 await runMyProfilePortfolioTests();
 await runProfileReviewTests();
 await runPersonalContextScoreTests();
+await runProposalDraftTests();
 await runScoreTests();
 
-console.log("v0.4 validation passed");
+console.log("v0.5 validation passed");
 
 async function runSettingsExportBackupTests() {
   const harness = await loadBackgroundForValidation({
@@ -445,7 +497,8 @@ async function runArchiveRestoreDeleteTests() {
           snapshotIds: ["snap_delete"],
           currentProfileId: "profile_delete",
           currentScoreResultId: "score_delete",
-          currentNotesRevisionId: "note_delete"
+          currentNotesRevisionId: "note_delete",
+          currentProposalDraftId: "proposal_delete"
         }),
         makeOpportunity("opp_keep", {
           snapshotIds: ["snap_keep"],
@@ -469,6 +522,10 @@ async function runArchiveRestoreDeleteTests() {
       [STORAGE_KEYS.noteRevisions]: [
         makeNote("note_delete", "opp_delete", "delete note"),
         makeNote("note_keep", "opp_keep", "keep note")
+      ],
+      [STORAGE_KEYS.proposalDrafts]: [
+        makeProposalDraft("proposal_delete", "opp_delete", { inputScoreResultId: "score_delete" }),
+        makeProposalDraft("proposal_keep", "opp_keep", { inputScoreResultId: "score_keep" })
       ]
     }
   });
@@ -489,8 +546,10 @@ async function runArchiveRestoreDeleteTests() {
   assert.equal(harness.storageData[STORAGE_KEYS.opportunityProfiles].some((item) => item.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.scoreResults].some((item) => item.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.noteRevisions].some((item) => item.opportunityId === "opp_delete"), false);
+  assert.equal(harness.storageData[STORAGE_KEYS.proposalDrafts].some((item) => item.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.opportunities].some((item) => item.id === "opp_keep"), true);
   assert.equal(harness.storageData[STORAGE_KEYS.snapshots].some((item) => item.opportunityId === "opp_keep"), true);
+  assert.equal(harness.storageData[STORAGE_KEYS.proposalDrafts].some((item) => item.opportunityId === "opp_keep"), true);
 }
 
 async function runNotesStaleTests() {
@@ -706,6 +765,158 @@ async function runPersonalContextScoreTests() {
   assert.equal(secondScore.inputMyProfileId, null);
   assert.equal(secondScore.inputMyProfileVersion, null);
   assert.deepEqual(secondScore.inputPortfolioCaseRefs, []);
+}
+
+async function runProposalDraftTests() {
+  const proposalStorageData = {
+    [STORAGE_KEYS.settings]: { ...DEFAULT_SETTINGS, apiKey: "key" },
+    [STORAGE_KEYS.opportunities]: [makeOpportunity("opp_proposal", {
+      status: OPPORTUNITY_STATUS.scored,
+      snapshotIds: ["snap_proposal"],
+      currentProfileId: "profile_proposal",
+      currentScoreResultId: "score_proposal",
+      currentNotesRevisionId: "note_proposal"
+    })],
+    [STORAGE_KEYS.snapshots]: [makeSnapshot("snap_proposal", "opp_proposal", {
+      text: "Build a Chrome MV3 extension with OpenAI scoring and local storage."
+    })],
+    [STORAGE_KEYS.opportunityProfiles]: [makeProfile("profile_proposal", "opp_proposal", {
+      inputSnapshotIds: ["snap_proposal"],
+      fields: mapRawProfileFields(fakeProfile, "2026-05-06T00:00:00.000Z")
+    })],
+    [STORAGE_KEYS.scoreResults]: [makeScore("score_proposal", "opp_proposal", {
+      inputProfileId: "profile_proposal",
+      inputProfileVersion: 1,
+      notesRevisionId: "note_proposal",
+      proposalAngle: "Lead with extension experience"
+    })],
+    [STORAGE_KEYS.noteRevisions]: [makeNote("note_proposal", "opp_proposal", "Mention MV3 permissions and storage.")],
+    [STORAGE_KEYS.myProfile]: makeMyProfile("my_profile_proposal", { version: 5 }),
+    [STORAGE_KEYS.portfolioCases]: [
+      makePortfolioCase("case_relevant", { version: 2, applicableKeywords: ["mv3", "extension"], skillTags: ["Chrome MV3"] }),
+      makePortfolioCase("case_irrelevant", {
+        title: "Accounting report",
+        summary: "Prepared ledger exports.",
+        outcome: "Delivered invoice summaries.",
+        proofPoints: ["Tax form cleanup"],
+        applicableKeywords: ["ledgerbook", "taxform"],
+        skillTags: ["Bookkeeping"]
+      })
+    ]
+  };
+  const harness = await loadBackgroundForValidation({
+    storageData: proposalStorageData,
+    fetchResponses: [
+      ({ init }) => {
+        const prompt = JSON.parse(init.body).input[0].content[0].text;
+        assert.match(prompt, /Fanbingqi/);
+        assert.match(prompt, /MV3 scoring extension/);
+        assert.doesNotMatch(prompt, /Accounting report/);
+        assert.match(prompt, /ScoreResult JSON/);
+        return openAIText(fakeProposal);
+      }
+    ]
+  });
+
+  const generated = await harness({ type: "proposal:generate", opportunityId: "opp_proposal" });
+  assert.equal(generated.ok, true, generated.error);
+  assert.equal(harness.storageData[STORAGE_KEYS.proposalDrafts].length, 1);
+  const draft = harness.storageData[STORAGE_KEYS.proposalDrafts][0];
+  assert.equal(harness.storageData[STORAGE_KEYS.opportunities][0].currentProposalDraftId, draft.id);
+  assert.equal(draft.status, PROPOSAL_DRAFT_STATUS.generated);
+  assert.equal(draft.inputScoreResultId, "score_proposal");
+  assert.equal(draft.inputMyProfileId, "my_profile_proposal");
+  assert.equal(draft.inputMyProfileVersion, 5);
+  assert.deepEqual(draft.selectedPortfolioCaseRefs, [{ id: "case_relevant", version: 2 }]);
+  assert.equal(draft.questionsToAsk[0], "Which Chrome stores are in scope?");
+  assert.equal(draft.unsupportedClaims[0].claim, "24 hour delivery");
+  assert.equal(draft.relevantProof[0].sourceRefs[0].sourceType, "portfolio_case");
+  assert.match(generated.opportunity.proposalDraft.finalText, /MV3 extension/);
+
+  const listed = await harness({ type: "proposal:list", opportunityId: "opp_proposal" });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.proposalDrafts.length, 1);
+  const fetched = await harness({ type: "proposal:get", id: draft.id });
+  assert.equal(fetched.proposalDraft.id, draft.id);
+
+  const edited = await harness({ type: "proposal:updateDraft", id: draft.id, patch: { finalText: "Edited proposal text." } });
+  assert.equal(edited.ok, true);
+  const editedDraft = harness.storageData[STORAGE_KEYS.proposalDrafts][0];
+  assert.equal(editedDraft.status, PROPOSAL_DRAFT_STATUS.edited);
+  assert.equal(editedDraft.finalText, "Edited proposal text.");
+  assert.equal(editedDraft.revisions.length, 1);
+
+  const proposalExport = await harness({ type: "data:export" });
+  assert.equal(proposalExport.exportData.manifest.entityCounts.proposalDrafts, 1);
+
+  const archived = await harness({ type: "proposal:archive", id: draft.id });
+  assert.equal(archived.ok, true);
+  assert.equal(archived.opportunity.currentProposalDraftId, null);
+  const activeDrafts = await harness({ type: "proposal:list", opportunityId: "opp_proposal" });
+  assert.equal(activeDrafts.proposalDrafts.length, 0);
+  const allDrafts = await harness({ type: "proposal:list", opportunityId: "opp_proposal", includeArchived: true });
+  assert.equal(allDrafts.proposalDrafts.length, 1);
+
+  const noScoreHarness = await loadBackgroundForValidation({
+    storageData: {
+      [STORAGE_KEYS.settings]: { ...DEFAULT_SETTINGS, apiKey: "key" },
+      [STORAGE_KEYS.opportunities]: [makeOpportunity("opp_no_score", { snapshotIds: ["snap_no_score"] })],
+      [STORAGE_KEYS.snapshots]: [makeSnapshot("snap_no_score", "opp_no_score")]
+    }
+  });
+  const noScore = await noScoreHarness({ type: "proposal:generate", opportunityId: "opp_no_score" });
+  assert.equal(noScore.ok, false);
+  assert.match(noScore.error, /Score this opportunity/);
+
+  const deferredProposal = deferred();
+  const lockHarness = await loadBackgroundForValidation({
+    storageData: proposalStorageData,
+    fetchResponses: [deferredProposal.promise]
+  });
+  const generating = lockHarness({ type: "proposal:generate", opportunityId: "opp_proposal" });
+  await waitUntil(() => lockHarness.fetchCalls.length === 1);
+  const notesWhileGenerating = lockHarness({ type: "notes:update", opportunityId: "opp_proposal", notes: "changed while generating" });
+  const notesResult = await Promise.race([notesWhileGenerating, delay(100).then(() => null)]);
+  assert.ok(notesResult, "notes update should not wait for proposal fetch");
+  assert.equal(notesResult.ok, true);
+  deferredProposal.resolve(openAIText(fakeProposal));
+  const staleProposal = await generating;
+  assert.equal(staleProposal.ok, false);
+  assert.match(staleProposal.error, /changed while generating proposal/);
+  assert.equal(lockHarness.storageData[STORAGE_KEYS.proposalDrafts].length, 0);
+
+  const proposalImport = structuredClone(validImportPayload);
+  proposalImport.data[STORAGE_KEYS.myProfile] = makeMyProfile("my_profile_proposal");
+  proposalImport.data[STORAGE_KEYS.portfolioCases] = [makePortfolioCase("case_relevant")];
+  proposalImport.data[STORAGE_KEYS.opportunities] = [makeOpportunity("opp_import_proposal", {
+    status: OPPORTUNITY_STATUS.scored,
+    snapshotIds: ["snap_import_proposal"],
+    currentProfileId: "profile_import_proposal",
+    currentScoreResultId: "score_import_proposal",
+    currentProposalDraftId: "draft_import_proposal"
+  })];
+  proposalImport.data[STORAGE_KEYS.snapshots] = [makeSnapshot("snap_import_proposal", "opp_import_proposal")];
+  proposalImport.data[STORAGE_KEYS.opportunityProfiles] = [makeProfile("profile_import_proposal", "opp_import_proposal", { inputSnapshotIds: ["snap_import_proposal"] })];
+  proposalImport.data[STORAGE_KEYS.scoreResults] = [makeScore("score_import_proposal", "opp_import_proposal", { inputProfileId: "profile_import_proposal" })];
+  proposalImport.data[STORAGE_KEYS.proposalDrafts] = [makeProposalDraft("draft_import_proposal", "opp_import_proposal", {
+    inputProfileId: "profile_import_proposal",
+    inputScoreResultId: "score_import_proposal"
+  })];
+  const proposalImportPreview = await sendBackgroundMessage({ type: "data:importPreview", data: proposalImport });
+  assert.equal(proposalImportPreview.ok, true);
+  assert.equal(proposalImportPreview.preview.entityCounts.proposalDrafts, 1);
+
+  const badProposalImport = structuredClone(proposalImport);
+  badProposalImport.data[STORAGE_KEYS.proposalDrafts][0].inputScoreResultId = "missing_score";
+  const badProposalPreview = await sendBackgroundMessage({ type: "data:importPreview", data: badProposalImport });
+  assert.equal(badProposalPreview.ok, false);
+  assert.match(badProposalPreview.error, /missing ScoreResult/);
+
+  const badSourceImport = structuredClone(proposalImport);
+  badSourceImport.data[STORAGE_KEYS.proposalDrafts][0].relevantProof[0].sourceRefs[0].sourceId = "case_missing";
+  const badSourcePreview = await sendBackgroundMessage({ type: "data:importPreview", data: badSourceImport });
+  assert.equal(badSourcePreview.ok, false);
+  assert.match(badSourcePreview.error, /missing selected Portfolio Case/);
 }
 
 async function runScoreTests() {
@@ -1064,6 +1275,64 @@ function makePortfolioCase(id = "case_extension", overrides = {}) {
     links: ["https://example.com/case"],
     applicableKeywords: ["extension", "mv3", "scoring"],
     sourceRefs: [],
+    archivedAt: null,
+    ...overrides
+  };
+}
+
+function makeProposalDraft(id = "draft_extension", opportunityId = "opp_extension", overrides = {}) {
+  const now = "2026-05-06T00:00:00.000Z";
+  return {
+    id,
+    opportunityId,
+    schemaVersion: SCHEMA_VERSION,
+    createdAt: now,
+    updatedAt: now,
+    status: PROPOSAL_DRAFT_STATUS.generated,
+    templateId: "default_direct_proof_v1",
+    model: "gpt-5.2",
+    promptVersion: PROMPT_VERSIONS.proposalPromptVersion,
+    inputProfileId: null,
+    inputProfileVersion: null,
+    inputScoreResultId: "score_import_proposal",
+    inputMyProfileId: "my_profile_proposal",
+    inputMyProfileVersion: 1,
+    selectedPortfolioCaseRefs: [{ id: "case_relevant", version: 1 }],
+    assumptions: ["Client needs extension help"],
+    unsupportedClaims: [],
+    questionsToAsk: ["Which browsers are in scope?"],
+    openingLine: "Hi, I can help with this extension.",
+    fitSummary: "This matches my extension work.",
+    relevantProof: [{
+      text: "I built a Chrome MV3 scoring extension.",
+      sourceRefs: [{
+        sourceType: "portfolio_case",
+        sourceId: "case_relevant",
+        fieldKey: "title",
+        label: "Relevant portfolio case",
+        quote: "MV3 scoring extension"
+      }]
+    }],
+    scopeBoundary: "I would confirm permissions and storage first.",
+    suggestedRateOrBid: {
+      text: "Use saved minimum project budget.",
+      sourceRefs: [{
+        sourceType: "my_profile",
+        sourceId: "my_profile_proposal",
+        fieldKey: "rateCard",
+        label: "Rate card",
+        quote: "$1000"
+      }]
+    },
+    finalText: "Hi, I can help with this extension.",
+    sourceRefs: [{
+      sourceType: "score_result",
+      sourceId: "score_import_proposal",
+      fieldKey: "proposalAngle",
+      label: "Score proposal angle",
+      quote: "Lead with extension experience"
+    }],
+    revisions: [],
     archivedAt: null,
     ...overrides
   };

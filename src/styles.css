@@ -225,6 +225,10 @@ label {
   gap: 6px;
 }
 
+.proposal-output-label {
+  margin-top: 12px;
+}
+
 .profile-field small {
   color: var(--muted);
   font-weight: 400;

@@ -18,6 +18,14 @@ const profileConflictsPanel = document.querySelector("#profileConflictsPanel");
 const summaryPanel = document.querySelector("#summaryPanel");
 const snapshotsList = document.querySelector("#snapshotsList");
 const detailsPanel = document.querySelector("#detailsPanel");
+const generateProposalButton = document.querySelector("#generateProposalButton");
+const saveProposalButton = document.querySelector("#saveProposalButton");
+const copyProposalButton = document.querySelector("#copyProposalButton");
+const archiveProposalButton = document.querySelector("#archiveProposalButton");
+const proposalBadge = document.querySelector("#proposalBadge");
+const proposalRiskPanel = document.querySelector("#proposalRiskPanel");
+const proposalOutput = document.querySelector("#proposalOutput");
+const proposalDetailsPanel = document.querySelector("#proposalDetailsPanel");
 
 let opportunities = [];
 let selectedId = null;
@@ -44,6 +52,10 @@ function bindEvents() {
   extractProfileButton.addEventListener("click", extractProfile);
   saveProfileButton.addEventListener("click", saveProfileCorrections);
   clearProfileButton.addEventListener("click", clearProfileCorrections);
+  generateProposalButton.addEventListener("click", generateProposal);
+  saveProposalButton.addEventListener("click", saveProposalEdit);
+  copyProposalButton.addEventListener("click", copyProposalText);
+  archiveProposalButton.addEventListener("click", archiveProposal);
 }
 
 async function refresh() {
@@ -202,6 +214,76 @@ async function clearProfileCorrections() {
   }
 }
 
+async function generateProposal() {
+  if (!selectedId) return;
+  setStatus("Generating proposal...");
+  setBusy(true);
+  try {
+    const response = await send({ type: "proposal:generate", opportunityId: selectedId });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Proposal draft generated");
+    renderSelected();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function saveProposalEdit() {
+  const draft = selectedOpportunity?.proposalDraft;
+  if (!draft) return;
+  setStatus("Saving proposal edit...");
+  setBusy(true);
+  try {
+    const response = await send({
+      type: "proposal:updateDraft",
+      id: draft.id,
+      patch: { finalText: proposalOutput.value }
+    });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Proposal edit saved");
+    renderSelected();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function copyProposalText() {
+  const draft = selectedOpportunity?.proposalDraft;
+  if (!draft || !proposalOutput.value.trim()) return;
+  if ((draft.unsupportedClaims || []).length && !confirm("This draft has unsupported claims. Copy anyway?")) return;
+  try {
+    await navigator.clipboard.writeText(proposalOutput.value);
+    setStatus("Proposal text copied");
+  } catch (error) {
+    setStatus(error.message || "Clipboard copy failed");
+  }
+}
+
+async function archiveProposal() {
+  const draft = selectedOpportunity?.proposalDraft;
+  if (!draft) return;
+  if (!confirm("Archive this proposal draft?")) return;
+  setStatus("Archiving proposal draft...");
+  setBusy(true);
+  try {
+    const response = await send({ type: "proposal:archive", id: draft.id });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Proposal draft archived");
+    renderSelected();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function renderOpportunitySelect() {
   opportunitySelect.innerHTML = "";
   if (!opportunities.length) {
@@ -234,6 +316,7 @@ function renderSelected() {
     detailsPanel.textContent = "No score yet.";
     notesInput.value = "";
     renderProfileEditor(null);
+    renderProposal(null);
     return;
   }
 
@@ -242,6 +325,7 @@ function renderSelected() {
   renderProfileEditor(opportunity);
   renderSnapshots(opportunity);
   renderDetails(opportunity);
+  renderProposal(opportunity);
 }
 
 function renderSummary(opportunity) {
@@ -403,6 +487,76 @@ function renderDetails(opportunity) {
   `;
 }
 
+function renderProposal(opportunity) {
+  const draft = opportunity?.proposalDraft || null;
+  const hasCurrentScore = Boolean(opportunity?.currentScoreResultId || opportunity?.scoreResult);
+  generateProposalButton.disabled = !opportunity || !hasCurrentScore || Boolean(opportunity?.scoreStale);
+  saveProposalButton.disabled = !draft;
+  copyProposalButton.disabled = !draft || !draft.finalText;
+  archiveProposalButton.disabled = !draft;
+
+  if (!opportunity) {
+    proposalBadge.className = "badge";
+    proposalBadge.textContent = "No draft";
+    proposalOutput.value = "";
+    proposalOutput.disabled = true;
+    proposalRiskPanel.className = "list empty";
+    proposalRiskPanel.textContent = "No unsupported claims.";
+    proposalDetailsPanel.className = "details empty";
+    proposalDetailsPanel.textContent = "No proposal metadata.";
+    return;
+  }
+
+  if (!draft) {
+    proposalBadge.className = "badge";
+    proposalBadge.textContent = hasCurrentScore ? "Ready" : "Score first";
+    proposalOutput.value = "";
+    proposalOutput.disabled = true;
+    proposalRiskPanel.className = "list empty";
+    proposalRiskPanel.textContent = opportunity.scoreStale ? "Re-score before generating a proposal." : "No unsupported claims.";
+    proposalDetailsPanel.className = "details empty";
+    proposalDetailsPanel.textContent = "No proposal metadata.";
+    return;
+  }
+
+  proposalBadge.className = `badge${draft.status === "edited" ? " reviewed" : ""}`;
+  proposalBadge.textContent = draft.status === "edited" ? "Edited" : "Generated";
+  proposalOutput.disabled = false;
+  proposalOutput.value = draft.finalText || "";
+  renderProposalRisks(draft);
+  proposalDetailsPanel.className = "details";
+  proposalDetailsPanel.innerHTML = `
+    <article class="dimension">
+      <header><strong>Inputs</strong></header>
+      <small>score ${escapeHtml(draft.inputScoreResultId || "none")}</small>
+      <small>profile version ${escapeHtml(draft.inputProfileVersion ?? "none")}</small>
+      <small>my profile version ${escapeHtml(draft.inputMyProfileVersion ?? "none")}</small>
+      <small>portfolio cases ${(draft.selectedPortfolioCaseRefs || []).map((item) => escapeHtml(item.id)).join(", ") || "none"}</small>
+    </article>
+    ${renderList("Questions to ask", draft.questionsToAsk)}
+    ${renderList("Assumptions", draft.assumptions)}
+  `;
+}
+
+function renderProposalRisks(draft) {
+  const unsupportedClaims = draft.unsupportedClaims || [];
+  if (!unsupportedClaims.length) {
+    proposalRiskPanel.className = "list empty";
+    proposalRiskPanel.textContent = "No unsupported claims.";
+    return;
+  }
+  proposalRiskPanel.className = "list";
+  proposalRiskPanel.innerHTML = `
+    <p class="warning">Unsupported claims must be reviewed before sending.</p>
+    ${unsupportedClaims.map((item) => `
+      <div class="conflict">
+        <strong>${escapeHtml(item.claim || "Unsupported claim")}</strong>
+        <small>${escapeHtml(item.reason || "No saved source supports this claim.")}</small>
+      </div>
+    `).join("")}
+  `;
+}
+
 function renderList(title, values) {
   if (!values?.length) return "";
   return `
@@ -458,6 +612,10 @@ function setBusy(isBusy) {
   extractProfileButton.disabled = isBusy || !selectedId;
   saveProfileButton.disabled = isBusy || !selectedOpportunity?.profile;
   clearProfileButton.disabled = isBusy || !selectedOpportunity?.profile?.reviewedAt;
+  generateProposalButton.disabled = isBusy || !selectedId || !selectedOpportunity?.currentScoreResultId || selectedOpportunity?.scoreStale;
+  saveProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft;
+  copyProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft?.finalText;
+  archiveProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft;
 }
 
 function setStatus(message) {

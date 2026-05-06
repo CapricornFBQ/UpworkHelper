@@ -2,6 +2,7 @@ import {
   DEFAULT_SETTINGS,
   OPPORTUNITY_STATUS,
   PLATFORM_HOSTS,
+  PROPOSAL_DRAFT_STATUS,
   PROMPT_VERSIONS,
   SCHEMA_VERSION,
   SNAPSHOT_RETENTION_STATE,
@@ -15,18 +16,20 @@ import {
   normalizeDimensions,
   normalizeMissingProfileFieldKeys,
   normalizeProfileFieldValue,
+  normalizeRawProposalDraft,
   normalizeRawScore,
   profileFieldsToLegacyRawProfile
 } from "../shared/adapters.js";
 
 const MAX_SNAPSHOT_CHARS = 70000;
 const MAX_SCORE_INPUT_CHARS = 110000;
+const MAX_PROPOSAL_INPUT_CHARS = 65000;
 const SNAPSHOT_COMPACT_CHARS = 2000;
 const BACKUP_PREFIX = "uosc_backup_v0_to_v1_";
 const SCORE_DECISIONS = ["strong_apply", "targeted_apply", "only_if_strong_fit", "skip"];
+const PROPOSAL_SOURCE_TYPES = Object.freeze(["opportunity_field", "snapshot_evidence", "my_profile", "portfolio_case", "notes", "score_result"]);
 const MANAGED_STORAGE_KEYS = Object.freeze(Object.values(STORAGE_KEYS));
 const UNIMPLEMENTED_IMPORT_KEYS = Object.freeze([
-  STORAGE_KEYS.proposalDrafts,
   STORAGE_KEYS.outcomeEvents,
   STORAGE_KEYS.clientRecords,
   STORAGE_KEYS.fieldSelectors,
@@ -126,6 +129,18 @@ async function handleMessage(message) {
     case "score:opportunity":
     case "scores:create":
       return { ok: true, opportunity: await scoreOpportunity(message.opportunityId) };
+    case "proposal:generate":
+      return { ok: true, opportunity: await generateProposalDraft(message.opportunityId) };
+    case "proposal:list":
+      return { ok: true, proposalDrafts: await listProposalDrafts(message.opportunityId, { includeArchived: Boolean(message.includeArchived) }) };
+    case "proposal:get":
+      return { ok: true, proposalDraft: await getProposalDraft(message.id) };
+    case "proposal:update":
+    case "proposal:updateDraft":
+      return { ok: true, opportunity: await updateProposalDraft(message.id, message.patch || message.draft || {}) };
+    case "proposal:archive":
+    case "proposal:delete":
+      return { ok: true, opportunity: await archiveProposalDraft(message.id) };
     default:
       throw new Error(`Unknown message type: ${message?.type || "empty"}`);
   }
@@ -746,6 +761,7 @@ async function deleteOpportunityPermanent(id) {
     store.opportunityProfiles = store.opportunityProfiles.filter((item) => item.opportunityId !== id);
     store.scoreResults = store.scoreResults.filter((item) => item.opportunityId !== id);
     store.noteRevisions = store.noteRevisions.filter((item) => item.opportunityId !== id);
+    store.proposalDrafts = store.proposalDrafts.filter((item) => item.opportunityId !== id);
     await writeStore(store);
   });
 }
@@ -1284,6 +1300,182 @@ async function scoreOpportunity(opportunityId) {
   });
 }
 
+async function generateProposalDraft(opportunityId) {
+  const settings = await getSettings();
+  if (!settings.apiKey) throw new Error("OpenAI API key is missing. Set it in Options first.");
+
+  const proposalInput = await withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.opportunities.findIndex((item) => item.id === opportunityId);
+    if (index === -1) throw new Error("Opportunity not found");
+    const opportunity = store.opportunities[index];
+    if (opportunity.status === OPPORTUNITY_STATUS.archived) throw new Error("Archived opportunity cannot generate proposals");
+    const detail = hydrateOpportunity(opportunity, store);
+    if (!detail.snapshots.length) throw new Error("No snapshots captured for this opportunity");
+    if (!opportunity.currentScoreResultId) throw new Error("Score this opportunity before generating a proposal");
+    if (detail.scoreStale) throw new Error("Current score is stale. Re-score before generating a proposal");
+
+    const score = store.scoreResults.find((item) => item.id === opportunity.currentScoreResultId);
+    if (!score) throw new Error("Current score result not found");
+    const profile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
+    const personalContext = await readPersonalContext();
+    const selectedPortfolioCases = selectRelevantPortfolioCases({ detail, score, portfolioCases: personalContext.portfolioCases });
+
+    return {
+      detail,
+      snapshotIds: [...opportunity.snapshotIds],
+      notesRevisionId: opportunity.currentNotesRevisionId || null,
+      currentProfileId: opportunity.currentProfileId || null,
+      currentScoreResultId: opportunity.currentScoreResultId || null,
+      currentProposalDraftId: opportunity.currentProposalDraftId || null,
+      status: opportunity.status,
+      score,
+      profile,
+      personalContext,
+      personalContextSignature: buildPersonalContextSignature(personalContext),
+      selectedPortfolioCases
+    };
+  });
+
+  const rawProposal = await generateProposalDraftText({
+    detail: proposalInput.detail,
+    score: proposalInput.score,
+    personalContext: proposalInput.personalContext,
+    selectedPortfolioCases: proposalInput.selectedPortfolioCases,
+    settings
+  });
+
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.opportunities.findIndex((item) => item.id === opportunityId);
+    if (index === -1) throw new Error("Opportunity not found");
+    const opportunity = store.opportunities[index];
+    const currentPersonalContext = await readPersonalContext();
+    if (
+      opportunity.status === OPPORTUNITY_STATUS.archived ||
+      opportunity.status !== proposalInput.status ||
+      (opportunity.currentProfileId || null) !== proposalInput.currentProfileId ||
+      (opportunity.currentScoreResultId || null) !== proposalInput.currentScoreResultId ||
+      (opportunity.currentProposalDraftId || null) !== proposalInput.currentProposalDraftId ||
+      buildPersonalContextSignature(currentPersonalContext) !== proposalInput.personalContextSignature ||
+      !arraysEqual(opportunity.snapshotIds, proposalInput.snapshotIds) ||
+      (opportunity.currentNotesRevisionId || null) !== proposalInput.notesRevisionId
+    ) {
+      throw new Error("Opportunity changed while generating proposal. Re-run proposal generation with the latest score and profile.");
+    }
+
+    const createdAt = new Date().toISOString();
+    const proposalDraft = createProposalDraftRecord({
+      id: crypto.randomUUID(),
+      opportunityId,
+      rawDraft: rawProposal,
+      model: settings.proposalModel,
+      inputProfileId: proposalInput.currentProfileId,
+      inputProfileVersion: proposalInput.profile?.version || null,
+      inputScoreResultId: proposalInput.currentScoreResultId,
+      inputMyProfile: proposalInput.personalContext.myProfile,
+      selectedPortfolioCases: proposalInput.selectedPortfolioCases,
+      createdAt
+    });
+    validateProposalSourceRefs(proposalDraft, {
+      opportunity,
+      snapshotIds: proposalInput.snapshotIds,
+      notesRevisionId: proposalInput.notesRevisionId,
+      profileId: proposalInput.currentProfileId,
+      scoreResultId: proposalInput.currentScoreResultId,
+      myProfileId: proposalInput.personalContext.myProfile?.id || null,
+      portfolioCaseIds: new Set(proposalInput.selectedPortfolioCases.map((item) => item.id))
+    });
+
+    store.proposalDrafts.push(proposalDraft);
+    store.opportunities[index] = {
+      ...opportunity,
+      currentProposalDraftId: proposalDraft.id,
+      updatedAt: proposalDraft.createdAt
+    };
+    await writeStore(store);
+    return hydrateOpportunity(store.opportunities[index], store);
+  });
+}
+
+async function listProposalDrafts(opportunityId, { includeArchived = false } = {}) {
+  if (!opportunityId) throw new Error("Opportunity id is required");
+  const store = await readStore();
+  return store.proposalDrafts
+    .filter((item) => item.opportunityId === opportunityId)
+    .filter((item) => includeArchived || !item.archivedAt)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
+}
+
+async function getProposalDraft(id) {
+  if (!id) return null;
+  const store = await readStore();
+  return store.proposalDrafts.find((item) => item.id === id) || null;
+}
+
+async function updateProposalDraft(id, patch) {
+  if (!id) throw new Error("Proposal draft id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const draftIndex = store.proposalDrafts.findIndex((item) => item.id === id);
+    if (draftIndex === -1) throw new Error("Proposal draft not found");
+    const draft = store.proposalDrafts[draftIndex];
+    if (draft.archivedAt) throw new Error("Archived proposal draft cannot be edited");
+    const opportunityIndex = store.opportunities.findIndex((item) => item.id === draft.opportunityId);
+    if (opportunityIndex === -1) throw new Error("Opportunity not found");
+    const finalText = normalizeText(patch.finalText ?? patch.final_proposal_text ?? patch.text);
+    if (!finalText) throw new Error("Proposal final text is required");
+    const now = new Date().toISOString();
+    const revision = {
+      id: crypto.randomUUID(),
+      createdAt: now,
+      createdBy: "user",
+      finalText
+    };
+    store.proposalDrafts[draftIndex] = {
+      ...draft,
+      updatedAt: now,
+      status: PROPOSAL_DRAFT_STATUS.edited,
+      finalText,
+      revisions: [...(draft.revisions || []), revision]
+    };
+    store.opportunities[opportunityIndex] = {
+      ...store.opportunities[opportunityIndex],
+      currentProposalDraftId: id,
+      updatedAt: now
+    };
+    await writeStore(store);
+    return hydrateOpportunity(store.opportunities[opportunityIndex], store);
+  });
+}
+
+async function archiveProposalDraft(id) {
+  if (!id) throw new Error("Proposal draft id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const draftIndex = store.proposalDrafts.findIndex((item) => item.id === id);
+    if (draftIndex === -1) throw new Error("Proposal draft not found");
+    const draft = store.proposalDrafts[draftIndex];
+    const opportunityIndex = store.opportunities.findIndex((item) => item.id === draft.opportunityId);
+    if (opportunityIndex === -1) throw new Error("Opportunity not found");
+    const now = new Date().toISOString();
+    store.proposalDrafts[draftIndex] = {
+      ...draft,
+      updatedAt: now,
+      status: PROPOSAL_DRAFT_STATUS.archived,
+      archivedAt: now
+    };
+    const opportunity = store.opportunities[opportunityIndex];
+    store.opportunities[opportunityIndex] = {
+      ...opportunity,
+      currentProposalDraftId: opportunity.currentProposalDraftId === id ? null : opportunity.currentProposalDraftId,
+      updatedAt: now
+    };
+    await writeStore(store);
+    return hydrateOpportunity(store.opportunities[opportunityIndex], store);
+  });
+}
+
 function arraysEqual(left, right) {
   const leftArray = Array.isArray(left) ? left : [];
   const rightArray = Array.isArray(right) ? right : [];
@@ -1467,6 +1659,240 @@ async function scoreOpportunityProfile(opportunity, profile, settings, personalC
   return result;
 }
 
+async function generateProposalDraftText({ detail, score, personalContext, selectedPortfolioCases, settings }) {
+  const sourceRefSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      source_type: { type: "string", enum: [...PROPOSAL_SOURCE_TYPES] },
+      source_id: { type: "string" },
+      field_key: { type: "string" },
+      label: { type: "string" },
+      quote: { type: "string" }
+    },
+    required: ["source_type", "source_id", "field_key", "label", "quote"]
+  };
+  const proofBlockSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      text: { type: "string" },
+      source_refs: { type: "array", items: sourceRefSchema }
+    },
+    required: ["text", "source_refs"]
+  };
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      assumptions: { type: "array", items: { type: "string" } },
+      unsupported_claims: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            claim: { type: "string" },
+            reason: { type: "string" },
+            source_refs: { type: "array", items: sourceRefSchema }
+          },
+          required: ["claim", "reason", "source_refs"]
+        }
+      },
+      questions_to_ask: { type: "array", items: { type: "string" } },
+      opening_line: { type: "string" },
+      fit_summary: { type: "string" },
+      relevant_proof: { type: "array", items: proofBlockSchema },
+      scope_boundary: { type: "string" },
+      suggested_rate_or_bid: proofBlockSchema,
+      final_proposal_text: { type: "string" },
+      source_refs: { type: "array", items: sourceRefSchema }
+    },
+    required: [
+      "assumptions",
+      "unsupported_claims",
+      "questions_to_ask",
+      "opening_line",
+      "fit_summary",
+      "relevant_proof",
+      "scope_boundary",
+      "suggested_rate_or_bid",
+      "final_proposal_text",
+      "source_refs"
+    ]
+  };
+
+  const prompt = [
+    "Generate an editable Upwork proposal draft. The extension must not write into Upwork or submit anything.",
+    "Rules:",
+    "- Use only the supplied Opportunity, ScoreResult, saved My Profile, selected Portfolio Cases, and Notes.",
+    "- Do not invent experience, outcomes, availability, deadlines, guarantees, or client-specific facts.",
+    "- If a useful claim has no source, put it in unsupported_claims instead of final_proposal_text.",
+    "- Every proof claim in relevant_proof, suggested_rate_or_bid, and top-level source_refs must include source_refs.",
+    "- source_type must be one of: opportunity_field, snapshot_evidence, my_profile, portfolio_case, notes, score_result.",
+    "- Keep final_proposal_text concise, direct, English by default, and focused on proof, scope, and next questions.",
+    "",
+    `Opportunity id: ${detail.id}`,
+    `Opportunity title: ${detail.title}`,
+    `User notes revision: ${detail.currentNotesRevisionId || ""}`,
+    `User notes: ${detail.notes || ""}`,
+    "",
+    "Effective extracted opportunity fields JSON:",
+    JSON.stringify(detail.effectiveProfile || null, null, 2),
+    "",
+    "ScoreResult JSON:",
+    JSON.stringify({
+      id: score.id,
+      totalScore: score.totalScore,
+      decision: score.decision,
+      decisionSummary: score.decisionSummary,
+      risks: score.risks,
+      missingInfoChecklist: score.missingInfoChecklist,
+      recommendedBidStrategy: score.recommendedBidStrategy,
+      proposalAngle: score.proposalAngle,
+      dimensions: score.dimensions
+    }, null, 2),
+    "",
+    "Saved My Profile JSON:",
+    JSON.stringify(personalContext.myProfile || null, null, 2),
+    "",
+    "Selected Portfolio Cases JSON:",
+    JSON.stringify(selectedPortfolioCases || [], null, 2),
+    "",
+    "Snapshot corpus:",
+    buildSnapshotCorpus(detail, MAX_PROPOSAL_INPUT_CHARS)
+  ].join("\n");
+
+  return callOpenAIJson({
+    apiKey: settings.apiKey,
+    model: settings.proposalModel,
+    reasoningEffort: settings.reasoningEffort || "low",
+    prompt,
+    schemaName: "upwork_proposal_draft",
+    schema
+  });
+}
+
+function createProposalDraftRecord({ id, opportunityId, rawDraft, model, inputProfileId, inputProfileVersion, inputScoreResultId, inputMyProfile, selectedPortfolioCases, createdAt }) {
+  const normalized = normalizeRawProposalDraft(rawDraft);
+  return {
+    id,
+    opportunityId,
+    schemaVersion: SCHEMA_VERSION,
+    createdAt,
+    updatedAt: createdAt,
+    status: PROPOSAL_DRAFT_STATUS.generated,
+    templateId: "default_direct_proof_v1",
+    model,
+    promptVersion: PROMPT_VERSIONS.proposalPromptVersion,
+    inputProfileId: inputProfileId || null,
+    inputProfileVersion: inputProfileVersion || null,
+    inputScoreResultId,
+    inputMyProfileId: inputMyProfile?.id || null,
+    inputMyProfileVersion: inputMyProfile?.version || null,
+    selectedPortfolioCaseRefs: (selectedPortfolioCases || []).map((item) => ({ id: item.id, version: item.version })),
+    assumptions: normalized.assumptions,
+    unsupportedClaims: normalized.unsupportedClaims,
+    questionsToAsk: normalized.questionsToAsk,
+    openingLine: normalized.openingLine,
+    fitSummary: normalized.fitSummary,
+    relevantProof: normalized.relevantProof,
+    scopeBoundary: normalized.scopeBoundary,
+    suggestedRateOrBid: normalized.suggestedRateOrBid,
+    finalText: normalized.finalText,
+    sourceRefs: normalized.sourceRefs,
+    revisions: [],
+    archivedAt: null
+  };
+}
+
+function selectRelevantPortfolioCases({ detail, score, portfolioCases }, limit = 3) {
+  const corpus = [
+    detail?.title,
+    detail?.notes,
+    JSON.stringify(detail?.effectiveProfile || {}),
+    score?.decisionSummary,
+    score?.recommendedBidStrategy,
+    score?.proposalAngle,
+    ...(score?.risks || []),
+    ...(score?.missingInfoChecklist || [])
+  ].join(" ").toLowerCase();
+  const corpusTokens = new Set(corpus.match(/[a-z0-9+#.-]{3,}/g) || []);
+
+  return (portfolioCases || [])
+    .filter((item) => !item.archivedAt)
+    .map((item) => {
+      const weightedTerms = [
+        ...(item.applicableKeywords || []).map((term) => [term, 4]),
+        ...(item.skillTags || []).map((term) => [term, 3]),
+        [item.title, 2],
+        [item.summary, 1],
+        [item.outcome, 1]
+      ];
+      let scoreValue = 0;
+      for (const [term, weight] of weightedTerms) {
+        const tokens = String(term || "").toLowerCase().match(/[a-z0-9+#.-]{3,}/g) || [];
+        if (!tokens.length) continue;
+        if (tokens.some((token) => corpus.includes(token) || corpusTokens.has(token))) scoreValue += weight;
+      }
+      return { item, scoreValue };
+    })
+    .filter(({ scoreValue }) => scoreValue > 0)
+    .sort((left, right) => {
+      if (right.scoreValue !== left.scoreValue) return right.scoreValue - left.scoreValue;
+      return new Date(right.item.updatedAt || right.item.createdAt) - new Date(left.item.updatedAt || left.item.createdAt);
+    })
+    .slice(0, limit)
+    .map(({ item }) => item);
+}
+
+function validateProposalSourceRefs(draft, context) {
+  for (const ref of collectProposalSourceRefs(draft)) {
+    if (!PROPOSAL_SOURCE_TYPES.includes(ref.sourceType)) {
+      throw new Error(`ProposalDraft ${draft.id} has unsupported sourceRef sourceType: ${ref.sourceType || "(missing)"}`);
+    }
+    if (!ref.sourceId) throw new Error(`ProposalDraft ${draft.id} sourceRef missing sourceId`);
+    if (ref.sourceType === "opportunity_field" && ref.sourceId !== context.opportunity.id) {
+      throw new Error(`ProposalDraft ${draft.id} sourceRef references missing opportunity`);
+    }
+    if (ref.sourceType === "snapshot_evidence" && !context.snapshotIds.includes(ref.sourceId)) {
+      throw new Error(`ProposalDraft ${draft.id} sourceRef references missing snapshot`);
+    }
+    if (ref.sourceType === "notes" && ref.sourceId !== context.notesRevisionId) {
+      throw new Error(`ProposalDraft ${draft.id} sourceRef references missing notes revision`);
+    }
+    if (ref.sourceType === "my_profile" && ref.sourceId !== context.myProfileId) {
+      throw new Error(`ProposalDraft ${draft.id} sourceRef references missing My Profile`);
+    }
+    if (ref.sourceType === "portfolio_case" && !context.portfolioCaseIds.has(ref.sourceId)) {
+      throw new Error(`ProposalDraft ${draft.id} sourceRef references missing selected Portfolio Case`);
+    }
+    if (ref.sourceType === "score_result" && ref.sourceId !== context.scoreResultId) {
+      throw new Error(`ProposalDraft ${draft.id} sourceRef references missing ScoreResult`);
+    }
+  }
+}
+
+function collectProposalSourceRefs(draft = {}) {
+  return [
+    ...(draft.sourceRefs || []),
+    ...flatMapSourceRefs(draft.relevantProof),
+    ...flatMapSourceRefs([draft.suggestedRateOrBid]),
+    ...flatMapSourceRefs(draft.unsupportedClaims)
+  ].map((ref) => ({
+    sourceType: normalizeText(ref.sourceType ?? ref.source_type),
+    sourceId: normalizeText(ref.sourceId ?? ref.source_id),
+    fieldKey: normalizeText(ref.fieldKey ?? ref.field_key),
+    label: normalizeText(ref.label),
+    quote: normalizeText(ref.quote)
+  }));
+}
+
+function flatMapSourceRefs(items) {
+  return (Array.isArray(items) ? items : [])
+    .flatMap((item) => Array.isArray(item?.sourceRefs) ? item.sourceRefs : (Array.isArray(item?.source_refs) ? item.source_refs : []));
+}
+
 function createProfileRecord({ id, opportunityId, rawProfile, model, inputSnapshotIds, version, createdAt }) {
   return {
     id,
@@ -1531,8 +1957,13 @@ function hydrateOpportunity(opportunity, store) {
     .map(toLegacySnapshot);
   const score = store.scoreResults.find((item) => item.id === opportunity.currentScoreResultId) || null;
   const profile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
+  const proposalDraft = store.proposalDrafts.find((item) => item.id === opportunity.currentProposalDraftId) || null;
   const notes = getCurrentNotesText(opportunity, store.noteRevisions);
   const scoreStale = Boolean(score && (score.notesRevisionId || null) !== (opportunity.currentNotesRevisionId || null));
+  const proposalStale = Boolean(proposalDraft && (
+    (proposalDraft.inputScoreResultId || null) !== (opportunity.currentScoreResultId || null) ||
+    (proposalDraft.inputProfileId || null) !== (opportunity.currentProfileId || null)
+  ));
 
   return {
     ...opportunity,
@@ -1545,6 +1976,8 @@ function hydrateOpportunity(opportunity, store) {
     extractedProfile: profile?.rawProfile || null,
     scoreStale,
     scoreResult: score ? toLegacyScoreResult(score, { scoreStale }) : null,
+    proposalStale,
+    proposalDraft,
     snapshotCount: snapshots.length,
     currentScore: score ? {
       id: score.id,
@@ -1741,7 +2174,8 @@ async function readStore() {
     STORAGE_KEYS.snapshots,
     STORAGE_KEYS.opportunityProfiles,
     STORAGE_KEYS.scoreResults,
-    STORAGE_KEYS.noteRevisions
+    STORAGE_KEYS.noteRevisions,
+    STORAGE_KEYS.proposalDrafts
   ]);
   return {
     meta: data[STORAGE_KEYS.meta] || null,
@@ -1749,7 +2183,8 @@ async function readStore() {
     snapshots: data[STORAGE_KEYS.snapshots] || [],
     opportunityProfiles: data[STORAGE_KEYS.opportunityProfiles] || [],
     scoreResults: data[STORAGE_KEYS.scoreResults] || [],
-    noteRevisions: data[STORAGE_KEYS.noteRevisions] || []
+    noteRevisions: data[STORAGE_KEYS.noteRevisions] || [],
+    proposalDrafts: data[STORAGE_KEYS.proposalDrafts] || []
   };
 }
 
@@ -1759,7 +2194,8 @@ async function writeStore(store) {
     [STORAGE_KEYS.snapshots]: store.snapshots,
     [STORAGE_KEYS.opportunityProfiles]: store.opportunityProfiles,
     [STORAGE_KEYS.scoreResults]: store.scoreResults,
-    [STORAGE_KEYS.noteRevisions]: store.noteRevisions
+    [STORAGE_KEYS.noteRevisions]: store.noteRevisions,
+    [STORAGE_KEYS.proposalDrafts]: store.proposalDrafts || []
   });
   await bumpStorageRevision();
 }
@@ -1843,6 +2279,7 @@ function validateImportData(importPayload) {
   const notes = requireArray(data[STORAGE_KEYS.noteRevisions], STORAGE_KEYS.noteRevisions);
   const myProfile = data[STORAGE_KEYS.myProfile] ?? null;
   const portfolioCases = requireArray(data[STORAGE_KEYS.portfolioCases] || [], STORAGE_KEYS.portfolioCases);
+  const proposalDrafts = requireArray(data[STORAGE_KEYS.proposalDrafts] || [], STORAGE_KEYS.proposalDrafts);
   validateEntityShape(opportunities, IMPORT_ENTITY_SCHEMAS.opportunity);
   validateEntityShape(snapshots, IMPORT_ENTITY_SCHEMAS.snapshot);
   validateEntityShape(profiles, IMPORT_ENTITY_SCHEMAS.opportunityProfile);
@@ -1850,7 +2287,8 @@ function validateImportData(importPayload) {
   validateEntityShape(notes, IMPORT_ENTITY_SCHEMAS.noteRevision);
   validateOptionalEntityShape(myProfile, IMPORT_ENTITY_SCHEMAS.myProfile);
   validateEntityShape(portfolioCases, IMPORT_ENTITY_SCHEMAS.portfolioCase);
-  validateReferences({ opportunities, snapshots, profiles, scores, notes });
+  validateEntityShape(proposalDrafts, IMPORT_ENTITY_SCHEMAS.proposalDraft);
+  validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts });
 
   return {
     schemaVersion: manifest.schemaVersion,
@@ -1861,7 +2299,8 @@ function validateImportData(importPayload) {
       scoreResults: scores.length,
       noteRevisions: notes.length,
       myProfile: myProfile ? 1 : 0,
-      portfolioCases: portfolioCases.length
+      portfolioCases: portfolioCases.length,
+      proposalDrafts: proposalDrafts.length
     }
   };
 }
@@ -1901,6 +2340,11 @@ const IMPORT_ENTITY_SCHEMAS = Object.freeze({
     name: "PortfolioCase",
     required: ["id", "schemaVersion", "version", "createdAt", "updatedAt", "title", "summary", "skillTags", "outcome", "proofPoints", "links", "applicableKeywords", "sourceRefs"],
     allowed: ["id", "schemaVersion", "version", "createdAt", "updatedAt", "title", "summary", "skillTags", "outcome", "proofPoints", "links", "applicableKeywords", "sourceRefs", "archivedAt"]
+  },
+  proposalDraft: {
+    name: "ProposalDraft",
+    required: ["id", "opportunityId", "schemaVersion", "createdAt", "updatedAt", "status", "templateId", "model", "promptVersion", "inputScoreResultId", "selectedPortfolioCaseRefs", "assumptions", "unsupportedClaims", "questionsToAsk", "openingLine", "fitSummary", "relevantProof", "scopeBoundary", "suggestedRateOrBid", "finalText", "sourceRefs", "revisions"],
+    allowed: ["id", "opportunityId", "schemaVersion", "createdAt", "updatedAt", "status", "templateId", "model", "promptVersion", "inputProfileId", "inputProfileVersion", "inputScoreResultId", "inputMyProfileId", "inputMyProfileVersion", "selectedPortfolioCaseRefs", "assumptions", "unsupportedClaims", "questionsToAsk", "openingLine", "fitSummary", "relevantProof", "scopeBoundary", "suggestedRateOrBid", "finalText", "sourceRefs", "revisions", "archivedAt"]
   }
 });
 
@@ -2007,8 +2451,23 @@ function requireArray(value, name) {
   return value;
 }
 
-function validateReferences({ opportunities, snapshots, profiles, scores, notes }) {
+function validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts }) {
   const opportunityIds = new Set(opportunities.map((item) => item.id));
+  const snapshotIds = new Set(snapshots.map((item) => item.id));
+  const profileIds = new Set(profiles.map((item) => item.id));
+  const scoreIds = new Set(scores.map((item) => item.id));
+  const noteIds = new Set(notes.map((item) => item.id));
+  const portfolioCaseIds = new Set(portfolioCases.map((item) => item.id));
+  const proposalDraftIds = new Set(proposalDrafts.map((item) => item.id));
+  for (const opportunity of opportunities) {
+    for (const snapshotId of opportunity.snapshotIds || []) {
+      if (!snapshotIds.has(snapshotId)) throw new Error(`Opportunity ${opportunity.id} references missing snapshot`);
+    }
+    if (opportunity.currentProfileId && !profileIds.has(opportunity.currentProfileId)) throw new Error(`Opportunity ${opportunity.id} references missing OpportunityProfile`);
+    if (opportunity.currentScoreResultId && !scoreIds.has(opportunity.currentScoreResultId)) throw new Error(`Opportunity ${opportunity.id} references missing ScoreResult`);
+    if (opportunity.currentNotesRevisionId && !noteIds.has(opportunity.currentNotesRevisionId)) throw new Error(`Opportunity ${opportunity.id} references missing notes revision`);
+    if (opportunity.currentProposalDraftId && !proposalDraftIds.has(opportunity.currentProposalDraftId)) throw new Error(`Opportunity ${opportunity.id} references missing ProposalDraft`);
+  }
   for (const snapshot of snapshots) {
     if (!opportunityIds.has(snapshot.opportunityId)) throw new Error(`Snapshot ${snapshot.id} references missing opportunity`);
   }
@@ -2021,6 +2480,26 @@ function validateReferences({ opportunities, snapshots, profiles, scores, notes 
   for (const note of notes) {
     if (!opportunityIds.has(note.opportunityId)) throw new Error(`Note ${note.id} references missing opportunity`);
   }
+  for (const draft of proposalDrafts) {
+    if (!Object.values(PROPOSAL_DRAFT_STATUS).includes(draft.status)) throw new Error(`ProposalDraft ${draft.id} has unsupported status`);
+    if (!opportunityIds.has(draft.opportunityId)) throw new Error(`ProposalDraft ${draft.id} references missing opportunity`);
+    if (draft.inputScoreResultId && !scoreIds.has(draft.inputScoreResultId)) throw new Error(`ProposalDraft ${draft.id} references missing ScoreResult`);
+    if (draft.inputProfileId && !profileIds.has(draft.inputProfileId)) throw new Error(`ProposalDraft ${draft.id} references missing OpportunityProfile`);
+    if (draft.inputMyProfileId && draft.inputMyProfileId !== myProfile?.id) throw new Error(`ProposalDraft ${draft.id} references missing My Profile`);
+    for (const caseRef of draft.selectedPortfolioCaseRefs || []) {
+      if (!portfolioCaseIds.has(caseRef.id)) throw new Error(`ProposalDraft ${draft.id} references missing PortfolioCase`);
+    }
+    const opportunity = opportunities.find((item) => item.id === draft.opportunityId);
+    validateProposalSourceRefs(draft, {
+      opportunity,
+      snapshotIds: (opportunity?.snapshotIds || []).filter((id) => snapshotIds.has(id)),
+      notesRevisionId: opportunity?.currentNotesRevisionId && noteIds.has(opportunity.currentNotesRevisionId) ? opportunity.currentNotesRevisionId : null,
+      profileId: draft.inputProfileId || null,
+      scoreResultId: draft.inputScoreResultId || null,
+      myProfileId: draft.inputMyProfileId || null,
+      portfolioCaseIds: new Set((draft.selectedPortfolioCaseRefs || []).map((item) => item.id))
+    });
+  }
 }
 
 function countExportEntities(data) {
@@ -2032,6 +2511,7 @@ function countExportEntities(data) {
     noteRevisions: (data[STORAGE_KEYS.noteRevisions] || []).length,
     myProfile: data[STORAGE_KEYS.myProfile] ? 1 : 0,
     portfolioCases: (data[STORAGE_KEYS.portfolioCases] || []).length,
+    proposalDrafts: (data[STORAGE_KEYS.proposalDrafts] || []).length,
     outcomeEvents: (data[STORAGE_KEYS.outcomeEvents] || []).length,
     clientRecords: (data[STORAGE_KEYS.clientRecords] || []).length,
     fieldSelectors: (data[STORAGE_KEYS.fieldSelectors] || []).length
