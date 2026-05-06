@@ -208,6 +208,12 @@ label {
   font-size: 13px;
 }
 
+.warning {
+  color: var(--warning);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .list-item {
   display: flex;
   justify-content: space-between;

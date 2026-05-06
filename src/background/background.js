@@ -595,7 +595,7 @@ async function scoreOpportunity(opportunityId) {
   const settings = await getSettings();
   if (!settings.apiKey) throw new Error("OpenAI API key is missing. Set it in Options first.");
 
-  return withStorageLock(async () => {
+  const scoringInput = await withStorageLock(async () => {
     const store = await readStore();
     const index = store.opportunities.findIndex((item) => item.id === opportunityId);
     if (index === -1) throw new Error("Opportunity not found");
@@ -603,30 +603,56 @@ async function scoreOpportunity(opportunityId) {
     const detail = hydrateOpportunity(opportunity, store);
     if (!detail.snapshots.length) throw new Error("No snapshots captured for this opportunity");
 
-    const rawProfile = await extractOpportunityProfile(detail, settings);
+    return {
+      detail,
+      snapshotIds: [...opportunity.snapshotIds],
+      notesRevisionId: opportunity.currentNotesRevisionId || null,
+      currentScoreResultId: opportunity.currentScoreResultId || null,
+      status: opportunity.status
+    };
+  });
+
+  const rawProfile = await extractOpportunityProfile(scoringInput.detail, settings);
+  const rawScore = await scoreOpportunityProfile(scoringInput.detail, rawProfile, settings);
+
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.opportunities.findIndex((item) => item.id === opportunityId);
+    if (index === -1) throw new Error("Opportunity not found");
+    const opportunity = store.opportunities[index];
+    if (
+      opportunity.status === OPPORTUNITY_STATUS.archived ||
+      opportunity.status !== scoringInput.status ||
+      (opportunity.currentScoreResultId || null) !== scoringInput.currentScoreResultId ||
+      !arraysEqual(opportunity.snapshotIds, scoringInput.snapshotIds) ||
+      (opportunity.currentNotesRevisionId || null) !== scoringInput.notesRevisionId
+    ) {
+      throw new Error("Opportunity changed while scoring. Re-run scoring with the latest snapshots and notes.");
+    }
+
     const profileVersion = store.opportunityProfiles.filter((item) => item.opportunityId === opportunityId).length + 1;
+    const createdAt = new Date().toISOString();
     const profileRecord = createProfileRecord({
       id: crypto.randomUUID(),
       opportunityId,
       rawProfile,
       model: settings.extractModel,
-      inputSnapshotIds: opportunity.snapshotIds,
+      inputSnapshotIds: scoringInput.snapshotIds,
       version: profileVersion,
-      createdAt: new Date().toISOString()
+      createdAt
     });
 
-    const rawScore = await scoreOpportunityProfile(detail, rawProfile, settings);
     const scoreRecord = createScoreRecord({
       id: crypto.randomUUID(),
       opportunityId,
       rawScore,
       model: settings.scoreModel,
-      inputSnapshotIds: opportunity.snapshotIds,
+      inputSnapshotIds: scoringInput.snapshotIds,
       inputProfileId: profileRecord.id,
       inputProfileVersion: profileRecord.version,
-      notesRevisionId: opportunity.currentNotesRevisionId,
+      notesRevisionId: scoringInput.notesRevisionId,
       profileReviewed: false,
-      createdAt: new Date().toISOString()
+      createdAt
     });
 
     store.opportunityProfiles.push(profileRecord);
@@ -641,6 +667,13 @@ async function scoreOpportunity(opportunityId) {
     await writeStore(store);
     return hydrateOpportunity(store.opportunities[index], store);
   });
+}
+
+function arraysEqual(left, right) {
+  const leftArray = Array.isArray(left) ? left : [];
+  const rightArray = Array.isArray(right) ? right : [];
+  if (leftArray.length !== rightArray.length) return false;
+  return leftArray.every((value, index) => value === rightArray[index]);
 }
 
 async function extractOpportunityProfile(opportunity, settings) {
@@ -872,19 +905,22 @@ function hydrateOpportunity(opportunity, store) {
   const score = store.scoreResults.find((item) => item.id === opportunity.currentScoreResultId) || null;
   const profile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
   const notes = getCurrentNotesText(opportunity, store.noteRevisions);
+  const scoreStale = Boolean(score && (score.notesRevisionId || null) !== (opportunity.currentNotesRevisionId || null));
 
   return {
     ...opportunity,
     snapshots,
     notes,
     extractedProfile: profile?.rawProfile || null,
-    scoreResult: score ? toLegacyScoreResult(score) : null,
+    scoreStale,
+    scoreResult: score ? toLegacyScoreResult(score, { scoreStale }) : null,
     snapshotCount: snapshots.length,
     currentScore: score ? {
       id: score.id,
       totalScore: score.totalScore,
       decision: score.decision,
-      decisionSummary: score.decisionSummary
+      decisionSummary: score.decisionSummary,
+      scoreStale
     } : null
   };
 }
@@ -901,7 +937,7 @@ function toLegacySnapshot(snapshot) {
   };
 }
 
-function toLegacyScoreResult(score) {
+function toLegacyScoreResult(score, { scoreStale = false } = {}) {
   return {
     ...(score.rawResult || {}),
     id: score.id,
@@ -921,7 +957,9 @@ function toLegacyScoreResult(score) {
     missing_info_checklist: score.missingInfoChecklist || [],
     recommended_bid_strategy: score.recommendedBidStrategy || "",
     proposal_angle: score.proposalAngle || "",
-    confidence: score.confidence
+    confidence: score.confidence,
+    notesRevisionId: score.notesRevisionId,
+    scoreStale
   };
 }
 

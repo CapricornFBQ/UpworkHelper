@@ -96,9 +96,17 @@ async function deleteSelected() {
 
 async function saveNotes() {
   if (!selectedId) return;
-  await send({ type: "opportunities:updateNotes", id: selectedId, notes: notesInput.value });
-  setStatus("Notes saved");
-  await refresh();
+  setStatus("Saving notes...");
+  setBusy(true);
+  try {
+    await send({ type: "opportunities:updateNotes", id: selectedId, notes: notesInput.value });
+    setStatus("Notes saved");
+    await refresh();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
 }
 
 function renderOpportunitySelect() {
@@ -143,6 +151,7 @@ function renderSelected() {
 function renderSummary(opportunity) {
   const score = opportunity.scoreResult?.total_score;
   const decision = opportunity.scoreResult?.decision_summary || "Not scored yet.";
+  const staleWarning = opportunity.scoreStale ? "<p class=\"warning\">Notes changed after this score. Re-score recommended.</p>" : "";
   summaryPanel.innerHTML = `
     <div class="score-card">
       <div>
@@ -156,6 +165,7 @@ function renderSummary(opportunity) {
     </div>
     <h2>${escapeHtml(opportunity.title)}</h2>
     <p>${escapeHtml(decision)}</p>
+    ${staleWarning}
     <a href="${escapeAttribute(opportunity.mainUrl)}" target="_blank" rel="noreferrer">Open source page</a>
   `;
 }
@@ -190,6 +200,7 @@ function renderDetails(opportunity) {
     return;
   }
   detailsPanel.className = "details";
+  const staleWarning = (opportunity.scoreStale || score.scoreStale) ? "<p class=\"warning\">Notes changed after this score. Re-score recommended.</p>" : "";
   const dimensions = (score.dimensions || []).map((dimension) => `
     <article class="dimension">
       <header>
@@ -203,6 +214,7 @@ function renderDetails(opportunity) {
   `).join("");
 
   detailsPanel.innerHTML = `
+    ${staleWarning}
     <div class="decision ${escapeHtml(score.decision)}">
       <strong>${escapeHtml(score.decision)}</strong>
       <p>${escapeHtml(score.decision_summary)}</p>
@@ -239,6 +251,8 @@ function getSelected() {
 function setBusy(isBusy) {
   captureButton.disabled = isBusy;
   scoreButton.disabled = isBusy || !selectedId;
+  deleteButton.disabled = isBusy || !selectedId;
+  saveNotesButton.disabled = isBusy || !selectedId;
 }
 
 function setStatus(message) {
