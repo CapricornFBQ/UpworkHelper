@@ -14,6 +14,7 @@
 - background 在每个 message handler 前执行 `ensureMigrated()`，支持从旧 embedded `uosc_opportunities` 迁移到 schemaVersion 1 分表结构。
 - OpenAI Responses API 两阶段处理：字段提取和 100 分评分。
 - Capture 默认严格限制 `https://www.upwork.com/*`，并阻止不同 jobKey 的 snapshot 混入已有 Opportunity。
+- 计划版本已绑定 Chrome extension 发布版本：`PLAN_VERSION = "0.2.0"`，`manifest.version = "0.2.0"`，并由 `scripts/validate_v0_2.mjs` 校验一致。
 - 不做自动刷新、自动翻页、自动打开 Upwork 页面、自动提交 proposal。
 
 当前已确认的基线差异和需要修正的问题：
@@ -24,7 +25,7 @@
 - 当前 `OpportunityProfile.fields` 已有字段级结构和 adapter；但 UI 仍主要展示 legacy score view model，尚未实现字段审核、conflict UI 和 `effectiveProfile`。
 - `score:opportunity` 当前在 storage write lock 内等待 OpenAI 网络响应，后续必须拆成读取快照、网络调用、写回三段。
 - `ScoreResult.notesRevisionId` 已保存，但 notes 更新后的 `scoreStale` 标记尚未实现。
-- Options 的 import UI 文案说 replace，但当前 `data:importCommit` 使用 `chrome.storage.local.set()` 覆盖传入 keys；缺失 keys 不会被自动删除。后续必须确认 import 是 merge 还是 replace，并让文档、UI、代码一致。
+- Import commit 语义已确认为 replace managed keys：commit 前删除 `Object.values(STORAGE_KEYS)` 中的受管理 keys，再写入导入数据，并保留当前本地 API Key。
 - 早期长期计划只列出数据类型名；本文后续已补 canonical contract、schema version、迁移、导入导出和验证规则。后续实现必须以这些补齐后的章节为准。
 - 当前风险边界已有静态检查；仍需 Chrome unpacked extension smoke 和真实业务 handler 测试。
 
@@ -936,9 +937,9 @@ v0.9 Selector Assist
    - 剩余修复：snapshot redacted/compacted UI 未实现；score 仍在 storage lock 内等待 OpenAI 网络响应，需要拆分。
 
 10. Import / Export 的隐私边界不完整。
-    - 状态：`[部分实现，存在 import 语义歧义]`。
-    - 证据：`data:export` 会把 `settings.apiKey` 置空；`data:importPreview` 会校验 schemaVersion、entity shape 和引用；`data:importCommit` 会先 backup，并保留当前本地 API Key。
-    - 剩余修复：UI 文案说 replace，但当前实现是对导入 payload 中的 keys 执行 `chrome.storage.local.set()`，不会删除缺失 keys。必须确认 import 是 merge 还是 replace；建议采用 replace managed keys，并在 commit 前删除受管理 storage keys 后再写入。
+    - 状态：`[部分实现，import 语义已修复]`。
+    - 证据：`data:export` 会把 `settings.apiKey` 置空；`data:importPreview` 会校验 schemaVersion、entity shape 和引用；`data:importCommit` 会先 backup，删除受管理 storage keys，再写入导入数据，并保留当前本地 API Key。
+    - 剩余修复：`data:export` 和 `data:createBackup` 还缺真实 handler 回归测试；完整 Chrome extension runtime smoke 仍未覆盖。
 
 ### 8.2 可直接采用的默认决策
 
@@ -1088,10 +1089,10 @@ uosc_analytics_cache
 
 6. Backup / Export / Import：
    - 来源：Options 数据工具。
-   - 写入：`data:createBackup` 写入 `uosc_backup_v0_to_v1_*`；`data:importCommit` 先 backup，再写入导入数据并保留当前 API Key。
+   - 写入：`data:createBackup` 写入 `uosc_backup_v0_to_v1_*`；`data:importCommit` 先 backup，再删除受管理 storage keys，写入导入数据并保留当前 API Key。
    - 读取：`data:getStorageUsage`、`data:export`、`data:importPreview`。
-   - 已实现：export 脱敏 API Key；import preview 校验 schemaVersion、known top-level keys、core entity shape、引用完整性。
-   - 缺口：import commit 当前是 `set()` 覆盖导入 payload 中的 keys，不会删除 payload 缺失的旧 keys；必须确认 merge/replace 语义并修正 UI 和代码。
+   - 已实现：export 脱敏 API Key；import preview 校验 schemaVersion、known top-level keys、core entity shape、引用完整性；import commit 按 replace managed keys 执行；未实现实体非空导入会被拒绝。
+   - 缺口：`data:export` 和 `data:createBackup` 还缺真实 handler 回归测试；完整 Chrome extension runtime smoke 未覆盖。
 
 ### 9.2 历史矛盾的当前状态
 
@@ -1137,10 +1138,10 @@ uosc_analytics_cache
    - 修复建议：Analytics 默认实时派生；如缓存，必须存 `uosc_analytics_cache`，并记录 `builtFromRevision`、`filters`、`scoreVersion`、`promptVersion`、`createdAt`。任何 Opportunity、ScoreResult、OutcomeEvent、ProposalDraft 变动都使相关 cache 失效。
 
 10. Import / Export 和 cascade 关系缺失。
-    - 状态：`[部分实现，仍有语义缺口]`。
+    - 状态：`[部分实现，import 语义已收敛]`。
     - 当前 import preview 会检查 core entity 引用完整性。
-    - 缺口：未来实体 key 允许出现在 import data，但未实现 shape validator；当前应拒绝未实现实体的非空导入，或补完整 validator。
-    - 缺口：import commit 是 merge 还是 replace 尚不明确；建议采用 replace managed keys。
+    - 当前未实现实体的非空导入已被拒绝，避免 future entity shape 未校验就进入 storage。
+    - 当前 import commit 已采用 replace managed keys；后续新增实体时必须同步补 validator 和引用校验。
 
 ### 9.3 推荐的长期事实表归属
 
@@ -1317,7 +1318,7 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 6. `[已实现，待完整 score handler 测试]` ScoreResult 增加 id、model、promptVersion、scoreVersion、inputSnapshotIds、inputProfileVersion、notesRevision。
 7. `[部分实现]` Notes 已增加 revision；score 后 notes 更新的 `scoreStale` UI/detail 标记未实现。
 8. `[已实现状态定义，UI 未实现]` 明确 snapshot retention 状态：`full`、`redacted`、`compacted`、`deleted_reference_only`。
-9. `[部分实现]` Export / Import preview 已做 entity count 和 core 引用完整性检查；未来实体 validator 和 import commit replace 语义未完成。
+9. `[部分实现]` Export / Import preview 已做 entity count 和 core 引用完整性检查；import commit 已按 replace managed keys 执行；未实现实体的非空导入已被拒绝。
 10. `[文档已定义，业务未实现]` Analytics 在 v0.2 不实现 UI，但先定义只从事实表派生，不能从缓存反推事实。
 11. `[已实现，待测试]` Capture 严格校验 host 和 jobKey，避免非 Upwork 页面或不同 job 混入已有 Opportunity。
 12. `[已实现，待扩展运行时验证]` 保护 API Key storage；新增 content script 前必须验证 content script 不能读取 `apiKey`。
@@ -1330,8 +1331,9 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 2. `src/shared/adapters.js` 统一承接 OpenAI snake_case response 到 canonical storage 字段的映射和分数 clamp。
 3. background 已拆出 `uosc_meta`、`uosc_snapshots`、`uosc_opportunity_profiles`、`uosc_score_results`、`uosc_note_revisions`，并保留旧数据迁移兼容。
 4. Options 已提供 storage usage、backup、export、import preview、import commit；导出结果不包含 API Key。
-5. `scripts/validate_v0_2.mjs` 已覆盖 JS syntax、风险静态扫描、adapter fake response、import validation 的有效/失败路径。
+5. `scripts/validate_v0_2.mjs` 已覆盖 JS syntax、风险静态扫描、adapter fake response、import validation 的有效/失败路径、import commit replace managed keys 和 API Key 保留。
 6. MCP / Playwright 已用 mocked `chrome.runtime` 验证 Options 数据 UI 的导出、预览导入、确认导入流程。
+7. `PLAN_VERSION = "0.2.0"` 已和 Chrome extension `manifest.version = "0.2.0"` 绑定，并由校验脚本断言一致。
 
 仍未进入 v0.2 或仍未验证的内容：
 
@@ -1339,9 +1341,7 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 2. ProposalDraft adapter 和 proposal fixture 是 v0.5，不能放进 v0.2 验收。
 3. Snapshot retention 的实际清理按钮和压缩/脱敏策略 UI 尚未实现；当前 v0.2 只定义状态并保留数据结构。
 4. 完整 Chrome unpacked extension runtime smoke 仍需人工或专门 Playwright persistent extension context 验证；当前 MCP 测试覆盖 Options UI，不等同于真实扩展上下文。
-5. `[需确认]` Import commit 的业务语义：当前代码更接近 merge/overwrite provided keys，UI 文案写 replace。建议确认后统一为“replace managed keys”，并让代码先清理受管理 keys 再写入导入数据。
-6. 未实现未来实体的非空导入处理：当前 top-level key 允许所有 `STORAGE_KEYS`，但 validator 只覆盖 core entities。建议 v0.2 暂时拒绝未实现实体的非空导入。
-7. Chrome 扩展发布版本仍是 `manifest.version = 0.1.0`；计划版本 v0.2 和扩展发布版本是否绑定需要明确。
+5. 真实 `data:export` 和 `data:createBackup` handler 回归仍需补齐；当前真实 handler 测试已覆盖 `data:importPreview` 和 `data:importCommit`。
 
 ### 9.9 当前业务闭环、测试缺口和修复依据
 
@@ -1356,7 +1356,7 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 | Opportunity archive/restore/delete | `opportunities:archive`、`opportunities:restore`、`opportunities:deletePermanent` | archive 软删除；restore 恢复；permanent delete 级联删除关联数据 | 没有真实 handler 测试 | 逻辑存在，但级联删除和列表过滤未被测试保护 |
 | Notes revision | `opportunities:updateNotes`、`notes:update` | 每次保存创建 revision；detail 读取 current revision；没有删除 | 没有真实 handler 测试 | 数据模型存在，但 stale score 判断未实现 |
 | Profile + Score | `score:opportunity` | 调 OpenAI 提取 profile，再评分，创建 `OpportunityProfile` 和 `ScoreResult`，更新 current ids | 只有 adapter fake response 测试；没有完整 score handler 测试 | 评分闭环存在，但没有 fake OpenAI 的端到端业务测试 |
-| Backup / Export / Import | `data:createBackup`、`data:export`、`data:importPreview`、`data:importCommit` | backup 创建备份；export 导出脱敏 settings；preview 校验；commit 备份后按导入 payload 覆盖对应 keys 并保留当前 API Key | `data:importPreview` 有真实 handler 测试；Options UI 是 mocked runtime | 只有 import preview 被真实覆盖；export/import commit/backup 仍需测试；replace/merge 语义需确认 |
+| Backup / Export / Import | `data:createBackup`、`data:export`、`data:importPreview`、`data:importCommit` | backup 创建备份；export 导出脱敏 settings；preview 校验；commit 备份后 replace managed keys 并保留当前 API Key | `data:importPreview`、`data:importCommit` 有真实 handler 测试；Options UI 是 mocked runtime | import 语义已闭合；export/createBackup 仍需真实 handler 测试 |
 | Migration | 所有 background message handler 前的 `ensureMigrated()` | 旧 embedded Opportunity 迁移到 v1 分表结构 | 没有 legacy fixture 测试 | 数据安全风险高，必须补旧数据样本测试 |
 | 风险边界 | `scripts/validate_v0_2.mjs` 静态扫描 | 检查自动化高风险 API 和 Upwork 私有 API 文本 | 有静态测试 | 只能证明代码文本没有命中，不能替代扩展运行时 smoke |
 
@@ -1366,7 +1366,7 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 
 1. `src/shared/adapters.js` 的 `mapRawProfileFields()`。
 2. `src/shared/adapters.js` 的 `normalizeRawScore()`。
-3. background 注册到 `chrome.runtime.onMessage` 的真实 handler，但目前只覆盖 `data:importPreview`。
+3. background 注册到 `chrome.runtime.onMessage` 的真实 handler，目前覆盖 `data:importPreview` 和 `data:importCommit`。
 4. manifest JSON parse、JS syntax check、风险关键字静态扫描。
 
 当前 MCP / Playwright 已覆盖：
@@ -1376,7 +1376,7 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 3. export button、import preview button、commit import button 的 UI 流程。
 4. 导出文本不包含 mocked API Key。
 
-MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试注入的是 mocked `chrome.runtime.sendMessage`。因此它只能证明 Options UI 按钮和状态文案流程正确，不能证明 `data:export`、`data:importCommit`、`data:createBackup` 的真实实现正确。
+MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试注入的是 mocked `chrome.runtime.sendMessage`。因此它只能证明 Options UI 按钮和状态文案流程正确；`data:importCommit` 已由 `scripts/validate_v0_2.mjs` 的真实 handler 测试覆盖，`data:export` 和 `data:createBackup` 仍未被真实 handler 测试覆盖。
 
 #### 9.9.3 必须新增的真实业务逻辑测试
 
@@ -1388,7 +1388,7 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
    - `settings:save` 后 `settings:get` 能读回归一化 settings。
    - API Key 会 trim。
    - export 永远不包含真实 API Key。
-   - import commit 必须保留当前本地 API Key，不能被导入文件覆盖为空或旧值。
+   - `[已覆盖]` import commit 必须保留当前本地 API Key，不能被导入文件覆盖为空或旧值。
 
 2. Migration：
    - legacy `uosc_opportunities` 内嵌 `snapshots`、`extractedProfile`、`scoreResult`、`notes` 时，会迁移成分表数据。
@@ -1429,12 +1429,12 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
    - `data:createBackup` 会写入 backup key，并更新 meta。
    - `data:export` 的 `manifest.entityCounts` 与真实数据数量一致。
    - `data:importPreview` 拒绝未知顶层 key、缺 required field、未知 entity field、坏引用、错误 schemaVersion。
-   - `data:importCommit` 会先 backup，再覆盖导入 payload 中包含的 storage keys，并保留当前 API Key。
+   - `[已覆盖]` `data:importCommit` 会先 backup，再删除受管理 storage keys，写入导入数据，并保留当前 API Key。
 
 #### 9.9.4 已确认潜在问题和修复方案
 
 1. 测试覆盖不足。
-   - 问题：当前只有 import preview 通过真实 background handler 测过，大多数 CRUD 只存在代码实现，没有回归测试。
+   - 问题：当前只有 import preview / import commit 通过真实 background handler 测过，大多数 CRUD 只存在代码实现，没有回归测试。
    - 修复：建立 background harness，以真实 message handler 为唯一入口补齐 9.9.3 的 case。
 
 2. Migration 无样本测试。
@@ -1453,9 +1453,9 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
    - 问题：ScoreResult 已保存 `notesRevisionId`，但 notes 更新后 UI/detail 没有明确标记旧 score 已过期。
    - 修复：在 `hydrateOpportunity()` 或 detail view model 中增加 `scoreStale`，当 `currentScoreResult.notesRevisionId !== currentNotesRevisionId` 时为 true；Side Panel 显示需要重新评分。
 
-6. `data:export` 和 `data:importCommit` 真实逻辑缺测试。
-   - 问题：API Key 脱敏和导入时保留当前 API Key 是安全边界，但目前主要靠代码审查和 UI mock。
-   - 修复：通过真实 handler 测 export 文本不含 API Key，import commit 后 settings.apiKey 仍等于导入前本地值。
+6. `data:export` 和 `data:createBackup` 真实逻辑缺测试。
+   - 问题：API Key 脱敏和备份完整性是安全边界，但 `data:export` 和 `data:createBackup` 还缺真实 handler 回归。
+   - 修复：通过真实 handler 测 export 文本不含 API Key、entityCounts 准确；backup key 存在且包含导入/修改前数据。
 
 7. Archive/restore/permanent delete 无级联测试。
    - 问题：永久删除若过滤条件错误，可能留下孤儿记录或误删其他 Opportunity 数据。
@@ -1474,16 +1474,19 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
     - 修复：保持在后续版本实施；每个新业务域进入实现前，必须先写 CRUD contract 和真实 handler 测试清单。
 
 11. Import commit 的 replace / merge 语义不一致。
-    - 问题：Options 文案说 replace local data，但当前 `data:importCommit` 使用 `chrome.storage.local.set()` 写入导入 payload，缺失的 storage key 不会被删除。
-    - 修复建议：`[需确认]` 建议定义为 replace managed keys：commit 前删除 `Object.values(STORAGE_KEYS)` 中由本插件管理的 keys，再写入导入数据；API Key 从当前 settings 回填。若选择 merge，则必须修改 UI 文案和风险说明。
+    - 状态：`[已修复]`。
+    - 决策：采用 replace managed keys。
+    - 证据：`data:importCommit` commit 前删除 `MANAGED_STORAGE_KEYS`，再写入导入数据；API Key 从当前 settings 回填；校验脚本覆盖旧 `uosc_proposal_drafts` 被清空和 API Key 保留。
 
 12. 未来实体 import validation 不完整。
-    - 问题：`validateKnownTopLevelKeys()` 允许所有 `STORAGE_KEYS`，但 shape validation 只覆盖 opportunities、snapshots、profiles、scores、notes。导入非空 `uosc_proposal_drafts`、`uosc_outcome_events` 等未来实体时，当前不会校验字段结构。
-    - 修复：v0.2 暂时拒绝未实现实体的非空导入；到对应版本实现时再补完整 validator 和引用校验。
+    - 状态：`[已修复 v0.2 边界]`。
+    - 决策：v0.2 暂时拒绝未实现实体的非空导入；到对应版本实现时再补完整 validator 和引用校验。
+    - 证据：`validateUnimplementedImportKeysAreEmpty()` 拒绝非空 `uosc_proposal_drafts`、`uosc_outcome_events` 等未来实体，校验脚本覆盖该失败路径。
 
 13. 计划版本和扩展发布版本关系不明确。
-    - 问题：文档使用 v0.2/v0.3 作为计划版本，`manifest.json` 仍是 `0.1.0`。
-    - 修复：明确计划版本是否绑定 Chrome extension `manifest.version`。建议绑定：每完成一个可加载、可验证的计划版本后同步更新 manifest version。
+    - 状态：`[已修复]`。
+    - 决策：计划版本绑定 Chrome extension `manifest.version`。
+    - 证据：`src/shared/schema.js` 导出 `PLAN_VERSION = "0.2.0"`，`manifest.json` 使用 `version = "0.2.0"`，校验脚本断言两者一致。
 
 14. immutable revision / event 是否必须有 `updatedAt` 没有例外规则。
     - 问题：第 2.0.2 写“每个模型至少包含 updatedAt”，但 `OpportunityNoteRevision` 当前只有 `createdAt`，append-only event/revision 通常不应更新。
@@ -1496,10 +1499,8 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
 3. P1：实现 `scoreStale`，补 notes revision 测试。
 4. P1：补 Settings 保存/读取/API Key 安全边界测试。
 5. P1：补 Chrome unpacked extension smoke，确认真实扩展上下文可加载。
-6. P1：确认并修复 import commit replace/merge 语义；补未来实体非空导入拒绝测试。
-7. P1：明确计划版本和 `manifest.version` 关系。
-8. P2：补 Snapshot retention UI 和测试。
-9. P2：进入 v0.3 Profile review 前，补 `effectiveProfile`、conflict UI 和字段级 correction 测试。
+6. P2：补 Snapshot retention UI 和测试。
+7. P2：进入 v0.3 Profile review 前，补 `effectiveProfile`、conflict UI 和字段级 correction 测试。
 
 ## 10. 字段唯一性契约：防止业务字段错位
 

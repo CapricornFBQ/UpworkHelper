@@ -13,6 +13,16 @@ const MAX_SNAPSHOT_CHARS = 70000;
 const MAX_SCORE_INPUT_CHARS = 110000;
 const BACKUP_PREFIX = "uosc_backup_v0_to_v1_";
 const SCORE_DECISIONS = ["strong_apply", "targeted_apply", "only_if_strong_fit", "skip"];
+const MANAGED_STORAGE_KEYS = Object.freeze(Object.values(STORAGE_KEYS));
+const UNIMPLEMENTED_IMPORT_KEYS = Object.freeze([
+  STORAGE_KEYS.myProfile,
+  STORAGE_KEYS.portfolioCases,
+  STORAGE_KEYS.proposalDrafts,
+  STORAGE_KEYS.outcomeEvents,
+  STORAGE_KEYS.clientRecords,
+  STORAGE_KEYS.fieldSelectors,
+  STORAGE_KEYS.analyticsCache
+]);
 
 let migrationPromise = null;
 let storageWriteQueue = Promise.resolve();
@@ -90,8 +100,7 @@ async function ensureMigrated() {
 }
 
 async function migrateToSchemaV1() {
-  const keys = Object.values(STORAGE_KEYS);
-  const data = await chrome.storage.local.get(keys);
+  const data = await chrome.storage.local.get(MANAGED_STORAGE_KEYS);
   const meta = data[STORAGE_KEYS.meta];
   if (meta?.schemaVersion === SCHEMA_VERSION) return meta;
 
@@ -130,7 +139,8 @@ async function migrateToSchemaV1() {
     [STORAGE_KEYS.proposalDrafts]: data[STORAGE_KEYS.proposalDrafts] || [],
     [STORAGE_KEYS.outcomeEvents]: data[STORAGE_KEYS.outcomeEvents] || [],
     [STORAGE_KEYS.clientRecords]: data[STORAGE_KEYS.clientRecords] || [],
-    [STORAGE_KEYS.fieldSelectors]: data[STORAGE_KEYS.fieldSelectors] || []
+    [STORAGE_KEYS.fieldSelectors]: data[STORAGE_KEYS.fieldSelectors] || [],
+    [STORAGE_KEYS.analyticsCache]: data[STORAGE_KEYS.analyticsCache] || {}
   });
 
   return nextMeta;
@@ -1117,7 +1127,7 @@ async function createBackup() {
 }
 
 async function exportData() {
-  const data = await chrome.storage.local.get(Object.values(STORAGE_KEYS));
+  const data = await chrome.storage.local.get(MANAGED_STORAGE_KEYS);
   const settings = normalizeSettings(data[STORAGE_KEYS.settings]);
   const safeSettings = {
     ...settings,
@@ -1144,6 +1154,7 @@ function validateImportData(importPayload) {
   if (!manifest || !data) throw new Error("Import file must contain manifest and data");
   if (manifest.schemaVersion !== SCHEMA_VERSION) throw new Error(`Unsupported schemaVersion: ${manifest.schemaVersion}`);
   validateKnownTopLevelKeys(data);
+  validateUnimplementedImportKeysAreEmpty(data);
 
   const opportunities = requireArray(data[STORAGE_KEYS.opportunities], STORAGE_KEYS.opportunities);
   const snapshots = requireArray(data[STORAGE_KEYS.snapshots], STORAGE_KEYS.snapshots);
@@ -1198,10 +1209,29 @@ const IMPORT_ENTITY_SCHEMAS = Object.freeze({
 });
 
 function validateKnownTopLevelKeys(data) {
-  const allowedKeys = new Set(Object.values(STORAGE_KEYS));
+  const allowedKeys = new Set(MANAGED_STORAGE_KEYS);
   for (const key of Object.keys(data)) {
     if (!allowedKeys.has(key)) throw new Error(`Unknown top-level import key: ${key}`);
   }
+}
+
+function validateUnimplementedImportKeysAreEmpty(data) {
+  for (const key of UNIMPLEMENTED_IMPORT_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(data, key)) continue;
+    const value = data[key];
+    if (isEmptyUnimplementedImportValue(key, value)) continue;
+    throw new Error(`${key} import is not supported yet; leave it empty or omit it`);
+  }
+}
+
+function isEmptyUnimplementedImportValue(key, value) {
+  if (key === STORAGE_KEYS.myProfile) return value === null || value === undefined;
+  if (key === STORAGE_KEYS.analyticsCache) return value === null || value === undefined || (isPlainObject(value) && Object.keys(value).length === 0);
+  return Array.isArray(value) && value.length === 0;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function validateEntityShape(records, schema) {
@@ -1224,18 +1254,51 @@ async function importData(importPayload) {
     const currentSettings = await getSettings();
     const importedSettings = normalizeSettings(importPayload.data[STORAGE_KEYS.settings]);
     importedSettings.apiKey = currentSettings.apiKey;
-    await chrome.storage.local.set({
-      ...importPayload.data,
-      [STORAGE_KEYS.meta]: {
-        schemaVersion: SCHEMA_VERSION,
-        storageRevision: 1,
-        importedAt: new Date().toISOString(),
-        lastBackupKey: backupKey
-      },
-      [STORAGE_KEYS.settings]: importedSettings
-    });
+    const now = new Date().toISOString();
+    await chrome.storage.local.remove(MANAGED_STORAGE_KEYS);
+    await chrome.storage.local.set(buildManagedImportData({
+      data: importPayload.data,
+      importedSettings,
+      backupKey,
+      importedAt: now
+    }));
     return { backupKey, preview };
   });
+}
+
+function buildManagedImportData({ data, importedSettings, backupKey, importedAt }) {
+  return {
+    ...createEmptyManagedImportData(),
+    ...data,
+    [STORAGE_KEYS.meta]: {
+      schemaVersion: SCHEMA_VERSION,
+      storageRevision: 1,
+      importedAt,
+      importMode: "replace_managed_keys",
+      lastBackupAt: importedAt,
+      lastBackupKey: backupKey
+    },
+    [STORAGE_KEYS.settings]: importedSettings
+  };
+}
+
+function createEmptyManagedImportData() {
+  return {
+    [STORAGE_KEYS.meta]: { schemaVersion: SCHEMA_VERSION },
+    [STORAGE_KEYS.settings]: normalizeSettings(),
+    [STORAGE_KEYS.opportunities]: [],
+    [STORAGE_KEYS.snapshots]: [],
+    [STORAGE_KEYS.opportunityProfiles]: [],
+    [STORAGE_KEYS.scoreResults]: [],
+    [STORAGE_KEYS.noteRevisions]: [],
+    [STORAGE_KEYS.myProfile]: null,
+    [STORAGE_KEYS.portfolioCases]: [],
+    [STORAGE_KEYS.proposalDrafts]: [],
+    [STORAGE_KEYS.outcomeEvents]: [],
+    [STORAGE_KEYS.clientRecords]: [],
+    [STORAGE_KEYS.fieldSelectors]: [],
+    [STORAGE_KEYS.analyticsCache]: {}
+  };
 }
 
 function requireArray(value, name) {

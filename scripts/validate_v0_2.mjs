@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_SETTINGS,
   OPPORTUNITY_STATUS,
+  PLAN_VERSION,
   PLATFORM_HOSTS,
   PROMPT_VERSIONS,
   SCHEMA_VERSION,
@@ -21,7 +22,8 @@ const jsFiles = [
   "src/sidepanel/sidepanel.js"
 ];
 
-JSON.parse(readFileSync("manifest.json", "utf8"));
+const manifest = JSON.parse(readFileSync("manifest.json", "utf8"));
+assert.equal(manifest.version, PLAN_VERSION);
 for (const file of jsFiles) {
   execFileSync("node", ["--check", file], { stdio: "pipe" });
 }
@@ -29,6 +31,7 @@ for (const file of jsFiles) {
 assert.equal(SCHEMA_VERSION, 1);
 assert.equal(DEFAULT_SETTINGS.captureMode, "strict_upwork");
 assert.equal(PLATFORM_HOSTS.upwork, "www.upwork.com");
+assert.equal(PLAN_VERSION, "0.2.0");
 assert.equal(OPPORTUNITY_STATUS.draft, "draft");
 assert.equal(OPPORTUNITY_STATUS.captured, "captured");
 assert.equal(SNAPSHOT_RETENTION_STATE.deletedReferenceOnly, "deleted_reference_only");
@@ -167,6 +170,36 @@ const missingReferencePreview = await sendBackgroundMessage({ type: "data:import
 assert.equal(missingReferencePreview.ok, false);
 assert.match(missingReferencePreview.error, /references missing opportunity/);
 
+const unsupportedFutureEntity = structuredClone(validImportPayload);
+unsupportedFutureEntity.data[STORAGE_KEYS.proposalDrafts] = [{ id: "draft_1" }];
+const unsupportedFutureEntityPreview = await sendBackgroundMessage({ type: "data:importPreview", data: unsupportedFutureEntity });
+assert.equal(unsupportedFutureEntityPreview.ok, false);
+assert.match(unsupportedFutureEntityPreview.error, /import is not supported yet/);
+
+sendBackgroundMessage.storageData[STORAGE_KEYS.settings] = { ...DEFAULT_SETTINGS, apiKey: "local-secret" };
+sendBackgroundMessage.storageData[STORAGE_KEYS.opportunities] = [{
+  id: "opp_stale",
+  schemaVersion: SCHEMA_VERSION,
+  createdAt: "2026-05-06T00:00:00.000Z",
+  updatedAt: "2026-05-06T00:00:00.000Z",
+  title: "Stale opportunity",
+  mainUrl: "https://www.upwork.com/jobs/stale",
+  platform: "upwork",
+  status: "captured",
+  snapshotIds: []
+}];
+sendBackgroundMessage.storageData[STORAGE_KEYS.proposalDrafts] = [{ id: "stale_future_entity" }];
+const importCommit = await sendBackgroundMessage({ type: "data:importCommit", data: validImportPayload });
+assert.equal(importCommit.ok, true);
+const importBackup = sendBackgroundMessage.storageData[importCommit.result.backupKey];
+assert.ok(importBackup);
+assert.equal(importBackup.data[STORAGE_KEYS.opportunities][0].id, "opp_stale");
+assert.equal(importBackup.data[STORAGE_KEYS.proposalDrafts][0].id, "stale_future_entity");
+assert.equal(sendBackgroundMessage.storageData[STORAGE_KEYS.settings].apiKey, "local-secret");
+assert.equal(sendBackgroundMessage.storageData[STORAGE_KEYS.opportunities].length, 0);
+assert.equal(sendBackgroundMessage.storageData[STORAGE_KEYS.proposalDrafts].length, 0);
+assert.equal(sendBackgroundMessage.storageData[STORAGE_KEYS.meta].importMode, "replace_managed_keys");
+
 console.log("v0.2 validation passed");
 
 async function loadBackgroundForValidation() {
@@ -184,7 +217,8 @@ async function loadBackgroundForValidation() {
     [STORAGE_KEYS.proposalDrafts]: [],
     [STORAGE_KEYS.outcomeEvents]: [],
     [STORAGE_KEYS.clientRecords]: [],
-    [STORAGE_KEYS.fieldSelectors]: []
+    [STORAGE_KEYS.fieldSelectors]: [],
+    [STORAGE_KEYS.analyticsCache]: {}
   };
 
   globalThis.chrome = {
@@ -218,6 +252,10 @@ async function loadBackgroundForValidation() {
         async set(values) {
           Object.assign(storageData, values);
         },
+        async remove(keys) {
+          const keyList = Array.isArray(keys) ? keys : [keys];
+          for (const key of keyList) delete storageData[key];
+        },
         async getBytesInUse() {
           return JSON.stringify(storageData).length;
         },
@@ -238,5 +276,7 @@ async function loadBackgroundForValidation() {
 
   await import(`../src/background/background.js?validate=${Date.now()}`);
   assert.ok(handler, "background onMessage handler not registered");
-  return (message) => new Promise((resolve) => handler(message, {}, resolve));
+  const sendMessage = (message) => new Promise((resolve) => handler(message, {}, resolve));
+  sendMessage.storageData = storageData;
+  return sendMessage;
 }
