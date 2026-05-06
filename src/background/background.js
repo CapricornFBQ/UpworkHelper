@@ -34,6 +34,8 @@ const OUTCOME_EVENT_TYPES = Object.freeze(Object.values(OUTCOME_EVENT_TYPE));
 const OUTCOME_STATUSES = Object.freeze(Object.values(OUTCOME_STATUS));
 const OUTCOME_EVENT_SOURCES = Object.freeze(["manual", "capture", "import"]);
 const CLIENT_IDENTITY_SOURCE_TYPES = Object.freeze(["manual", "exact", "import", "merge", "split"]);
+const ANALYTICS_WINDOWS = Object.freeze(["last_30_days", "last_90_days", "all_time"]);
+const ANALYTICS_LOW_SAMPLE_APPLIED_COUNT = 20;
 const MANAGED_STORAGE_KEYS = Object.freeze(Object.values(STORAGE_KEYS));
 const UNIMPLEMENTED_IMPORT_KEYS = Object.freeze([
   STORAGE_KEYS.fieldSelectors,
@@ -175,6 +177,16 @@ async function handleMessage(message) {
       return { ok: true, clientRecord: await mergeClientRecords(message.sourceId || message.sourceClientRecordId, message.targetId || message.targetClientRecordId) };
     case "clients:split":
       return { ok: true, clientRecord: await splitClientRecord(message.sourceId || message.sourceClientRecordId, message.opportunityIds || [], message.clientRecord || message.client || {}) };
+    case "analytics:getSummary":
+      return { ok: true, analyticsSummary: await getAnalyticsSummary(message.filters || message) };
+    case "analytics:getByScoreBand":
+      return { ok: true, groups: await getAnalyticsGroups("scoreBand", message.filters || message) };
+    case "analytics:getBySkill":
+      return { ok: true, groups: await getAnalyticsGroups("skill", message.filters || message) };
+    case "analytics:getByClientType":
+      return { ok: true, groups: await getAnalyticsGroups("clientType", message.filters || message) };
+    case "analytics:getByTemplate":
+      return { ok: true, groups: await getAnalyticsGroups("template", message.filters || message) };
     default:
       throw new Error(`Unknown message type: ${message?.type || "empty"}`);
   }
@@ -2037,6 +2049,228 @@ function deriveClientSummary(clientRecordId, store) {
     }),
     previousOutcomes
   };
+}
+
+async function getAnalyticsSummary(filters = {}) {
+  const store = await readStore();
+  return buildAnalyticsSummary(store, normalizeAnalyticsFilters(filters));
+}
+
+async function getAnalyticsGroups(groupBy, filters = {}) {
+  const store = await readStore();
+  return buildAnalyticsGroups(store, normalizeAnalyticsFilters(filters), groupBy);
+}
+
+function buildAnalyticsSummary(store, filters) {
+  const rows = buildAnalyticsRows(store, filters);
+  const metrics = calculateAnalyticsMetrics(rows);
+  return {
+    id: `analytics_${filters.window}_${filters.scoreVersion || "all"}_${filters.promptVersion || "all"}`,
+    schemaVersion: SCHEMA_VERSION,
+    createdAt: new Date().toISOString(),
+    filters,
+    scoreVersion: filters.scoreVersion || "all",
+    promptVersion: filters.promptVersion || "all",
+    window: filters.window,
+    metrics,
+    sampleSizes: {
+      totalOpportunities: rows.length,
+      scored: rows.filter((row) => Number.isFinite(row.totalScore)).length,
+      applied: metrics.appliedCount,
+      lowSampleThreshold: ANALYTICS_LOW_SAMPLE_APPLIED_COUNT
+    },
+    calibration: buildCalibration(metrics),
+    groups: {
+      scoreBands: buildAnalyticsGroupsFromRows(rows, "scoreBand"),
+      skills: buildAnalyticsGroupsFromRows(rows, "skill"),
+      clientTypes: buildAnalyticsGroupsFromRows(rows, "clientType"),
+      templates: buildAnalyticsGroupsFromRows(rows, "template")
+    },
+    builtFromRevision: store.meta?.storageRevision || 0
+  };
+}
+
+function buildAnalyticsGroups(store, filters, groupBy) {
+  return buildAnalyticsGroupsFromRows(buildAnalyticsRows(store, filters), groupBy);
+}
+
+function buildAnalyticsRows(store, filters) {
+  return (store.opportunities || [])
+    .filter((opportunity) => filters.includeArchived || opportunity.status !== OPPORTUNITY_STATUS.archived)
+    .filter((opportunity) => isOpportunityInAnalyticsWindow(opportunity, filters.window))
+    .map((opportunity) => buildAnalyticsRow(opportunity, store))
+    .filter((row) => !filters.scoreVersion || row.scoreVersion === filters.scoreVersion)
+    .filter((row) => !filters.promptVersion || row.promptVersion === filters.promptVersion)
+    .filter((row) => !filters.skill || row.skills.includes(filters.skill))
+    .filter((row) => !filters.scoreBand || row.scoreBand === filters.scoreBand)
+    .filter((row) => !filters.clientType || row.clientType === filters.clientType)
+    .filter((row) => !filters.templateId || row.templateId === filters.templateId);
+}
+
+function buildAnalyticsRow(opportunity, store) {
+  const score = store.scoreResults.find((item) => item.id === opportunity.currentScoreResultId) || null;
+  const profile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
+  const proposalDraft = store.proposalDrafts.find((item) => item.id === opportunity.currentProposalDraftId) || null;
+  const outcomeSummary = deriveOutcomeSummary(opportunity.id, store.outcomeEvents);
+  const skills = normalizeAnalyticsSkillList(profile?.fields?.requiredSkills?.value);
+  const clientType = normalizeAnalyticsGroupValue(profile?.fields?.clientType?.value, "unknown_client_type");
+  return {
+    opportunityId: opportunity.id,
+    createdAt: opportunity.createdAt,
+    updatedAt: opportunity.updatedAt,
+    status: opportunity.status,
+    totalScore: score?.totalScore ?? null,
+    scoreBand: scoreBandForScore(score?.totalScore),
+    scoreVersion: score?.scoreVersion || "unscored",
+    promptVersion: score?.promptVersion || "unscored",
+    skills: skills.length ? skills : ["unknown_skill"],
+    clientType,
+    templateId: proposalDraft?.templateId || "no_template",
+    proposalStatus: proposalDraft?.status || "no_proposal",
+    outcomeStatus: outcomeSummary.status,
+    applied: Boolean(outcomeSummary.appliedAt),
+    viewed: Boolean(outcomeSummary.viewedAt),
+    replied: Boolean(outcomeSummary.repliedAt),
+    interviewing: Boolean(outcomeSummary.interviewAt),
+    hired: Boolean(outcomeSummary.hiredAt),
+    lost: Boolean(outcomeSummary.lostAt),
+    connectsSpent: outcomeSummary.connectsSpent
+  };
+}
+
+function calculateAnalyticsMetrics(rows) {
+  const appliedRows = rows.filter((row) => row.applied);
+  const scoredRows = rows.filter((row) => Number.isFinite(row.totalScore));
+  const connectsRows = appliedRows.filter((row) => Number.isFinite(row.connectsSpent));
+  const metrics = {
+    totalOpportunities: rows.length,
+    scoredCount: scoredRows.length,
+    appliedCount: appliedRows.length,
+    viewedCount: rows.filter((row) => row.viewed).length,
+    repliedCount: rows.filter((row) => row.replied).length,
+    interviewCount: rows.filter((row) => row.interviewing).length,
+    hiredCount: rows.filter((row) => row.hired).length,
+    lostCount: rows.filter((row) => row.lost).length,
+    averageScore: average(scoredRows.map((row) => row.totalScore)),
+    averageConnectsSpent: average(connectsRows.map((row) => row.connectsSpent))
+  };
+  metrics.viewedRate = rate(metrics.viewedCount, metrics.appliedCount);
+  metrics.replyRate = rate(metrics.repliedCount, metrics.appliedCount);
+  metrics.interviewRate = rate(metrics.interviewCount, metrics.appliedCount);
+  metrics.hiredRate = rate(metrics.hiredCount, metrics.appliedCount);
+  metrics.lostRate = rate(metrics.lostCount, metrics.appliedCount);
+  metrics.lowSample = metrics.appliedCount < ANALYTICS_LOW_SAMPLE_APPLIED_COUNT;
+  return metrics;
+}
+
+function buildAnalyticsGroupsFromRows(rows, groupBy) {
+  const groupMap = new Map();
+  for (const row of rows) {
+    const keys = analyticsGroupKeys(row, groupBy);
+    for (const key of keys) {
+      if (!groupMap.has(key)) groupMap.set(key, []);
+      groupMap.get(key).push(row);
+    }
+  }
+  return [...groupMap.entries()]
+    .map(([key, groupRows]) => ({
+      key,
+      label: key.replaceAll("_", " "),
+      metrics: calculateAnalyticsMetrics(groupRows)
+    }))
+    .sort((a, b) => b.metrics.totalOpportunities - a.metrics.totalOpportunities || a.key.localeCompare(b.key));
+}
+
+function analyticsGroupKeys(row, groupBy) {
+  if (groupBy === "scoreBand") return [row.scoreBand];
+  if (groupBy === "skill") return row.skills;
+  if (groupBy === "clientType") return [row.clientType];
+  if (groupBy === "template") return [row.templateId];
+  return ["all"];
+}
+
+function buildCalibration(metrics) {
+  if (metrics.lowSample) {
+    return {
+      lowSample: true,
+      suggestions: [],
+      message: `Need at least ${ANALYTICS_LOW_SAMPLE_APPLIED_COUNT} applied opportunities for calibration suggestions.`
+    };
+  }
+  const suggestions = [];
+  if (metrics.replyRate >= 0.35) suggestions.push("Reply rate is strong for this filter; consider prioritizing similar opportunities.");
+  if (metrics.replyRate < 0.12) suggestions.push("Reply rate is weak for this filter; consider lowering priority or tightening red flags.");
+  if (metrics.hiredRate >= 0.12) suggestions.push("Hire rate is strong enough to preserve this segment in scoring.");
+  if (metrics.averageConnectsSpent !== null && metrics.hiredCount === 0) suggestions.push("Connect spend has not produced hires in this sample; review bid selectivity.");
+  return {
+    lowSample: false,
+    suggestions,
+    message: suggestions.length ? "" : "No strong calibration signal in this sample."
+  };
+}
+
+function normalizeAnalyticsFilters(input = {}) {
+  const window = ANALYTICS_WINDOWS.includes(input.window) ? input.window : "all_time";
+  return {
+    window,
+    includeArchived: Boolean(input.includeArchived),
+    scoreVersion: normalizeOptionalFilter(input.scoreVersion || input.score_version),
+    promptVersion: normalizeOptionalFilter(input.promptVersion || input.prompt_version),
+    skill: normalizeAnalyticsGroupFilter(input.skill),
+    scoreBand: normalizeOptionalFilter(input.scoreBand || input.score_band),
+    clientType: normalizeAnalyticsGroupFilter(input.clientType || input.client_type),
+    templateId: normalizeOptionalFilter(input.templateId || input.template_id)
+  };
+}
+
+function normalizeOptionalFilter(value) {
+  const text = normalizeText(value);
+  return text && text !== "all" ? text : "";
+}
+
+function normalizeAnalyticsGroupFilter(value) {
+  const text = normalizeOptionalFilter(value);
+  return text ? normalizeAnalyticsGroupValue(text, "") : "";
+}
+
+function isOpportunityInAnalyticsWindow(opportunity, window) {
+  if (window === "all_time") return true;
+  const days = window === "last_30_days" ? 30 : 90;
+  const createdAt = Date.parse(opportunity.createdAt || opportunity.updatedAt);
+  if (Number.isNaN(createdAt)) return false;
+  return createdAt >= Date.now() - days * 24 * 60 * 60 * 1000;
+}
+
+function scoreBandForScore(score) {
+  if (!Number.isFinite(score)) return "no_score";
+  if (score >= 80) return "80_100";
+  if (score >= 60) return "60_79";
+  if (score >= 40) return "40_59";
+  return "0_39";
+}
+
+function normalizeAnalyticsSkillList(value) {
+  const list = Array.isArray(value) ? value : normalizeStringList(value);
+  return list.map((item) => normalizeAnalyticsGroupValue(item, "")).filter(Boolean);
+}
+
+function normalizeAnalyticsGroupValue(value, fallback) {
+  const text = normalizeText(Array.isArray(value) ? value.join(" ") : value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return text || fallback;
+}
+
+function rate(numerator, denominator) {
+  if (!denominator) return null;
+  return Math.round((numerator / denominator) * 1000) / 1000;
+}
+
+function average(values) {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (!finite.length) return null;
+  return Math.round((finite.reduce((sum, value) => sum + value, 0) / finite.length) * 10) / 10;
 }
 
 function normalizeOutcomeEventInput(input, { opportunity, proposalDrafts, outcomeEvents }) {

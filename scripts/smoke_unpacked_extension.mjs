@@ -46,6 +46,19 @@ async function main() {
       title: "Upwork Scorer",
       selectors: ["#captureButton", "#opportunitySelect"]
     });
+    await smokeStaticExtensionPage(extensionId, "src/analytics/analytics.html", {
+      title: "Analytics",
+      selectors: [
+        "#analyticsWindow",
+        "#analyticsScoreVersion",
+        "#refreshAnalyticsButton",
+        "#analyticsMetrics",
+        "#scoreBandGroups",
+        "#skillGroups",
+        "#clientTypeGroups",
+        "#templateGroups"
+      ]
+    });
     await smokeSidePanelPage(extensionId);
 
     console.log(`unpacked extension smoke passed: ${extensionId}`);
@@ -107,7 +120,8 @@ async function smokeOptionsPage(extensionId) {
     "#savePortfolioButton",
     "#archivePortfolioButton",
     "#previewImportButton",
-    "#commitImportButton"
+    "#commitImportButton",
+    "a[href='../analytics/analytics.html']"
   ]), true);
 
   const settingsResponse = JSON.parse(await evaluate(page.sessionId, `

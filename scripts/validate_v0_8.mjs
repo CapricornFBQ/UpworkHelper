@@ -30,6 +30,7 @@ const jsFiles = [
   "src/background/background.js",
   "src/popup/popup.js",
   "src/options/options.js",
+  "src/analytics/analytics.js",
   "src/sidepanel/sidepanel.js"
 ];
 let backgroundImportCounter = 0;
@@ -43,7 +44,7 @@ for (const file of jsFiles) {
 assert.equal(SCHEMA_VERSION, 1);
 assert.equal(DEFAULT_SETTINGS.captureMode, "strict_upwork");
 assert.equal(PLATFORM_HOSTS.upwork, "www.upwork.com");
-assert.equal(PLAN_VERSION, "0.7.0");
+assert.equal(PLAN_VERSION, "0.8.0");
 assert.equal(OPPORTUNITY_STATUS.draft, "draft");
 assert.equal(OPPORTUNITY_STATUS.captured, "captured");
 assert.equal(OUTCOME_STATUS.applied, "applied");
@@ -287,9 +288,10 @@ await runPersonalContextScoreTests();
 await runProposalDraftTests();
 await runOutcomeEventTests();
 await runClientRecordTests();
+await runAnalyticsTests();
 await runScoreTests();
 
-console.log("v0.7 validation passed");
+console.log("v0.8 validation passed");
 
 async function runSettingsExportBackupTests() {
   const harness = await loadBackgroundForValidation({
@@ -1248,6 +1250,127 @@ async function runClientRecordTests() {
   const duplicateClientPreview = await sendBackgroundMessage({ type: "data:importPreview", data: duplicateClientImport });
   assert.equal(duplicateClientPreview.ok, false);
   assert.match(duplicateClientPreview.error, /duplicates active primaryClientKey/);
+}
+
+async function runAnalyticsTests() {
+  const harness = await loadBackgroundForValidation({
+    storageData: {
+      [STORAGE_KEYS.meta]: { schemaVersion: SCHEMA_VERSION, storageRevision: 42 },
+      [STORAGE_KEYS.opportunities]: [
+        makeOpportunity("opp_analytics_a", {
+          status: OPPORTUNITY_STATUS.scored,
+          currentProfileId: "profile_analytics_a",
+          currentScoreResultId: "score_analytics_a",
+          currentProposalDraftId: "draft_analytics_a"
+        }),
+        makeOpportunity("opp_analytics_b", {
+          status: OPPORTUNITY_STATUS.scored,
+          currentProfileId: "profile_analytics_b",
+          currentScoreResultId: "score_analytics_b",
+          currentProposalDraftId: "draft_analytics_b"
+        }),
+        makeOpportunity("opp_analytics_c", {
+          status: OPPORTUNITY_STATUS.scored,
+          currentProfileId: "profile_analytics_c",
+          currentScoreResultId: "score_analytics_c"
+        })
+      ],
+      [STORAGE_KEYS.opportunityProfiles]: [
+        makeProfile("profile_analytics_a", "opp_analytics_a", {
+          fields: {
+            requiredSkills: { value: ["Chrome MV3", "JavaScript"] },
+            clientType: { value: "repeat buyer" }
+          }
+        }),
+        makeProfile("profile_analytics_b", "opp_analytics_b", {
+          fields: {
+            requiredSkills: { value: ["Chrome MV3", "Automation"] },
+            clientType: { value: "new client" }
+          }
+        }),
+        makeProfile("profile_analytics_c", "opp_analytics_c", {
+          fields: {
+            requiredSkills: { value: ["Data scraping"] },
+            clientType: { value: "new client" }
+          }
+        })
+      ],
+      [STORAGE_KEYS.scoreResults]: [
+        makeScore("score_analytics_a", "opp_analytics_a", { totalScore: 85 }),
+        makeScore("score_analytics_b", "opp_analytics_b", { totalScore: 68 }),
+        makeScore("score_analytics_c", "opp_analytics_c", { totalScore: 45 })
+      ],
+      [STORAGE_KEYS.proposalDrafts]: [
+        makeProposalDraft("draft_analytics_a", "opp_analytics_a", { templateId: "direct_proof", inputScoreResultId: "score_analytics_a" }),
+        makeProposalDraft("draft_analytics_b", "opp_analytics_b", { templateId: "direct_proof", inputScoreResultId: "score_analytics_b" })
+      ],
+      [STORAGE_KEYS.outcomeEvents]: [
+        makeOutcomeEvent("outcome_analytics_a_sent", "opp_analytics_a", {
+          eventType: OUTCOME_EVENT_TYPE.proposalSent,
+          payload: {
+            connectsSpent: 8,
+            bidAmount: 1200,
+            bidCurrency: "USD",
+            bidType: "fixed",
+            proposalDraftId: "draft_analytics_a",
+            proposalTextRevisionId: null
+          }
+        }),
+        makeOutcomeEvent("outcome_analytics_a_reply", "opp_analytics_a", { eventType: OUTCOME_EVENT_TYPE.clientReplied }),
+        makeOutcomeEvent("outcome_analytics_b_sent", "opp_analytics_b", {
+          eventType: OUTCOME_EVENT_TYPE.proposalSent,
+          payload: {
+            connectsSpent: 12,
+            bidAmount: 800,
+            bidCurrency: "USD",
+            bidType: "fixed",
+            proposalDraftId: "draft_analytics_b",
+            proposalTextRevisionId: null
+          }
+        }),
+        makeOutcomeEvent("outcome_analytics_c_skip", "opp_analytics_c", { eventType: OUTCOME_EVENT_TYPE.markedSkipped })
+      ]
+    }
+  });
+
+  const summary = await harness({ type: "analytics:getSummary", filters: { window: "all_time" } });
+  assert.equal(summary.ok, true);
+  assert.equal(summary.analyticsSummary.builtFromRevision, 42);
+  assert.equal(summary.analyticsSummary.metrics.totalOpportunities, 3);
+  assert.equal(summary.analyticsSummary.metrics.appliedCount, 2);
+  assert.equal(summary.analyticsSummary.metrics.repliedCount, 1);
+  assert.equal(summary.analyticsSummary.metrics.replyRate, 0.5);
+  assert.equal(summary.analyticsSummary.metrics.averageConnectsSpent, 10);
+  assert.equal(summary.analyticsSummary.metrics.lowSample, true);
+  assert.equal(summary.analyticsSummary.calibration.suggestions.length, 0);
+  assert.equal(summary.analyticsSummary.groups.scoreBands.some((item) => item.key === "80_100"), true);
+
+  const scoreBands = await harness({ type: "analytics:getByScoreBand", filters: { window: "all_time" } });
+  assert.equal(scoreBands.ok, true);
+  assert.equal(scoreBands.groups.find((item) => item.key === "80_100").metrics.appliedCount, 1);
+  assert.equal(scoreBands.groups.find((item) => item.key === "60_79").metrics.appliedCount, 1);
+
+  const skills = await harness({ type: "analytics:getBySkill", filters: { window: "all_time" } });
+  assert.equal(skills.ok, true);
+  assert.equal(skills.groups.find((item) => item.key === "chrome_mv3").metrics.totalOpportunities, 2);
+
+  const chromeOnly = await harness({ type: "analytics:getSummary", filters: { window: "all_time", skill: "Chrome MV3" } });
+  assert.equal(chromeOnly.analyticsSummary.metrics.totalOpportunities, 2);
+  assert.equal(chromeOnly.analyticsSummary.metrics.appliedCount, 2);
+
+  const clientTypes = await harness({ type: "analytics:getByClientType", filters: { window: "all_time" } });
+  assert.equal(clientTypes.groups.find((item) => item.key === "new_client").metrics.totalOpportunities, 2);
+
+  const templates = await harness({ type: "analytics:getByTemplate", filters: { window: "all_time" } });
+  assert.equal(templates.groups.find((item) => item.key === "direct_proof").metrics.totalOpportunities, 2);
+
+  const versionFiltered = await harness({ type: "analytics:getSummary", filters: { window: "all_time", scoreVersion: PROMPT_VERSIONS.scoreRuleVersion } });
+  assert.equal(versionFiltered.analyticsSummary.metrics.totalOpportunities, 3);
+
+  const emptyVersion = await harness({ type: "analytics:getSummary", filters: { window: "all_time", scoreVersion: "missing_version" } });
+  assert.equal(emptyVersion.analyticsSummary.metrics.totalOpportunities, 0);
+
+  assert.deepEqual(harness.storageData[STORAGE_KEYS.analyticsCache], {});
 }
 
 async function runScoreTests() {

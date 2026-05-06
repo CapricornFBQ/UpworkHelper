@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Analytics</title>
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body class="page">
+    <main class="shell wide-shell">
+      <header class="page-header">
+        <h1>Analytics</h1>
+        <p id="analyticsStatus">Loading analytics...</p>
+      </header>
+
+      <section class="settings-form">
+        <div class="grid-2">
+          <label>
+            Window
+            <select id="analyticsWindow">
+              <option value="all_time">All time</option>
+              <option value="last_90_days">Last 90 days</option>
+              <option value="last_30_days">Last 30 days</option>
+            </select>
+          </label>
+          <label>
+            Score version
+            <input id="analyticsScoreVersion" type="text" placeholder="all">
+          </label>
+          <label>
+            Prompt version
+            <input id="analyticsPromptVersion" type="text" placeholder="all">
+          </label>
+          <label>
+            Skill
+            <input id="analyticsSkill" type="text" placeholder="all">
+          </label>
+        </div>
+        <label class="inline-check">
+          <input id="analyticsIncludeArchived" type="checkbox">
+          Include archived opportunities
+        </label>
+        <div class="button-row">
+          <button id="refreshAnalyticsButton" class="primary" type="button">Refresh analytics</button>
+        </div>
+      </section>
+
+      <section class="settings-form">
+        <div class="section-header">
+          <h2>Overview</h2>
+          <span id="analyticsSampleBadge" class="badge">No sample</span>
+        </div>
+        <div id="analyticsMetrics" class="metric-grid"></div>
+        <div id="analyticsCalibration" class="details empty">No calibration signal.</div>
+      </section>
+
+      <section class="settings-form">
+        <h2>Score bands</h2>
+        <div id="scoreBandGroups" class="analytics-table empty">No score band data.</div>
+      </section>
+
+      <section class="settings-form">
+        <h2>Skills</h2>
+        <div id="skillGroups" class="analytics-table empty">No skill data.</div>
+      </section>
+
+      <section class="settings-form">
+        <h2>Client types</h2>
+        <div id="clientTypeGroups" class="analytics-table empty">No client type data.</div>
+      </section>
+
+      <section class="settings-form">
+        <h2>Proposal templates</h2>
+        <div id="templateGroups" class="analytics-table empty">No template data.</div>
+      </section>
+    </main>
+
+    <script type="module" src="./analytics.js"></script>
+  </body>
+</html>
