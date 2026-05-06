@@ -164,6 +164,8 @@ async function handleMessage(message) {
       return { ok: true, clientRecord: await getClientRecord(message.id) };
     case "clients:create":
       return { ok: true, clientRecord: await createClientRecord(message.clientRecord || message.client || {}, message.opportunityId || null) };
+    case "clients:startIdentityPicking":
+      return { ok: true, identity: await startClientIdentityPicking() };
     case "clients:update":
       return { ok: true, clientRecord: await updateClientRecord(message.id, message.clientRecord || message.client || {}) };
     case "clients:archive":
@@ -1817,6 +1819,30 @@ async function getClientRecord(id) {
   return clientRecord ? toClientViewModel(clientRecord, store) : null;
 }
 
+async function startClientIdentityPicking() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) throw new Error("No active tab found");
+  const tabUrl = parseUrl(tab.url);
+  if (!tabUrl || tabUrl.protocol !== "https:" || tabUrl.hostname !== PLATFORM_HOSTS.upwork) {
+    throw new Error("Client identity picking is limited to https://www.upwork.com pages");
+  }
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pickClientIdentityOnPage
+  });
+  if (!result?.href) throw new Error(result?.error || "Pick an employer profile link with a URL");
+  const href = normalizeUpworkClientHref(result.href, tab.url);
+  if (!href) throw new Error("Picked link is not a stable Upwork URL");
+  return {
+    source: "exact",
+    primaryClientKey: `exact:upwork-client-url:${href}`,
+    href,
+    displayName: normalizeText(result.sampleText),
+    selector: normalizeText(result.selector),
+    sampleText: normalizeText(result.sampleText)
+  };
+}
+
 async function createClientRecord(input = {}, opportunityId = null) {
   return withStorageLock(async () => {
     const store = await readStore();
@@ -2085,6 +2111,18 @@ function normalizeOptionalIsoTime(value) {
   const time = Date.parse(text);
   if (Number.isNaN(time)) throw new Error("ClientRecord date field must be a valid ISO date");
   return new Date(time).toISOString();
+}
+
+function normalizeUpworkClientHref(href, baseUrl) {
+  try {
+    const url = new URL(href, baseUrl);
+    if (url.protocol !== "https:" || url.hostname !== PLATFORM_HOSTS.upwork) return "";
+    url.hash = "";
+    url.search = "";
+    return url.href.replace(/\/$/, "");
+  } catch {
+    return "";
+  }
 }
 
 function ensureUniqueClientKey(clientRecords, candidate) {
@@ -2682,6 +2720,104 @@ function extractSelectorValuesOnPage(fieldSelectors = []) {
     }
   }
   return { url: location.href, pageText: pageText.slice(0, 5000), selectorResults };
+}
+
+function pickClientIdentityOnPage() {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = [
+      "position:fixed",
+      "z-index:2147483647",
+      "pointer-events:none",
+      "border:2px solid #167a57",
+      "background:rgba(22,122,87,0.08)",
+      "display:none"
+    ].join(";");
+    const label = document.createElement("div");
+    label.textContent = "Pick employer profile link. Press Esc to cancel.";
+    label.style.cssText = [
+      "position:fixed",
+      "z-index:2147483647",
+      "left:12px",
+      "top:12px",
+      "padding:8px 10px",
+      "border-radius:6px",
+      "background:#167a57",
+      "color:#fff",
+      "font:13px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+    ].join(";");
+    document.documentElement.append(overlay, label);
+
+    function cleanText(value) {
+      return String(value || "").replace(/\s+/g, " ").trim();
+    }
+    function cleanup() {
+      document.removeEventListener("pointerover", onPointerOver, true);
+      document.removeEventListener("click", onClick, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      overlay.remove();
+      label.remove();
+    }
+    function selectorFor(element) {
+      if (element.id) return `#${CSS.escape(element.id)}`;
+      const dataAttr = ["data-test", "data-qa", "data-testid"].find((name) => element.getAttribute(name));
+      if (dataAttr) return `${element.tagName.toLowerCase()}[${dataAttr}="${CSS.escape(element.getAttribute(dataAttr))}"]`;
+      const parts = [];
+      let node = element;
+      while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.body && parts.length < 5) {
+        let part = node.tagName.toLowerCase();
+        if (node.classList.length) part += `.${CSS.escape([...node.classList][0])}`;
+        const parent = node.parentElement;
+        if (parent) {
+          const sameTag = [...parent.children].filter((child) => child.tagName === node.tagName);
+          if (sameTag.length > 1) part += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
+        }
+        parts.unshift(part);
+        node = parent;
+      }
+      return parts.join(" > ");
+    }
+    function highlight(target) {
+      if (!target?.getBoundingClientRect) return;
+      const rect = target.getBoundingClientRect();
+      overlay.style.display = "block";
+      overlay.style.left = `${rect.left}px`;
+      overlay.style.top = `${rect.top}px`;
+      overlay.style.width = `${rect.width}px`;
+      overlay.style.height = `${rect.height}px`;
+    }
+    function onPointerOver(event) {
+      const target = event.target?.closest?.("a[href]") || event.target;
+      if (!target || target === overlay || target === label) return;
+      highlight(target);
+    }
+    function onClick(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      const link = event.target?.closest?.("a[href]");
+      cleanup();
+      if (!link) {
+        resolve({ error: "Pick an employer profile link with a URL" });
+        return;
+      }
+      resolve({
+        href: link.href || link.getAttribute("href") || "",
+        selector: selectorFor(link),
+        sampleText: cleanText(link.innerText || link.textContent || link.getAttribute("aria-label") || "").slice(0, 1000),
+        url: location.href
+      });
+    }
+    function onKeyDown(event) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      cleanup();
+      resolve({ error: "Client identity picking canceled" });
+    }
+    document.addEventListener("pointerover", onPointerOver, true);
+    document.addEventListener("click", onClick, true);
+    document.addEventListener("keydown", onKeyDown, true);
+  });
 }
 
 function normalizeOutcomeEventInput(input, { opportunity, proposalDrafts, outcomeEvents }) {

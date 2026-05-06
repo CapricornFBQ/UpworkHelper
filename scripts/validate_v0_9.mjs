@@ -1105,6 +1105,27 @@ async function runOutcomeEventTests() {
 }
 
 async function runClientRecordTests() {
+  const identityHarness = await loadBackgroundForValidation({
+    activeTab: { id: 1, url: "https://www.upwork.com/jobs/details/client-identity", title: "Client identity" },
+    scriptResult: {
+      href: "/clients/acme-client?ref=job",
+      selector: "a.client-link",
+      sampleText: "Acme Client",
+      url: "https://www.upwork.com/jobs/details/client-identity"
+    }
+  });
+  const pickedIdentity = await identityHarness({ type: "clients:startIdentityPicking" });
+  assert.equal(pickedIdentity.ok, true, pickedIdentity.error);
+  assert.equal(pickedIdentity.identity.primaryClientKey, "exact:upwork-client-url:https://www.upwork.com/clients/acme-client");
+  assert.equal(pickedIdentity.identity.displayName, "Acme Client");
+
+  const insecureIdentityHarness = await loadBackgroundForValidation({
+    activeTab: { id: 1, url: "http://www.upwork.com/jobs/details/client-identity", title: "Client identity" }
+  });
+  const insecureIdentity = await insecureIdentityHarness({ type: "clients:startIdentityPicking" });
+  assert.equal(insecureIdentity.ok, false);
+  assert.match(insecureIdentity.error, /limited to https:\/\/www\.upwork\.com/);
+
   const harness = await loadBackgroundForValidation({
     storageData: {
       [STORAGE_KEYS.opportunities]: [

@@ -182,6 +182,7 @@ async function smokeSidePanelPage(extensionId) {
     "#proposalOutput",
     "#proposalRiskPanel",
     "#clientRecordSelect",
+    "#pickClientIdentityButton",
     "#saveClientButton",
     "#clientHistoryPanel",
     "#outcomeFilter",

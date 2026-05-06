@@ -31,6 +31,7 @@ const clientPrimaryKey = document.querySelector("#clientPrimaryKey");
 const clientDisplayName = document.querySelector("#clientDisplayName");
 const clientNotes = document.querySelector("#clientNotes");
 const clientRedFlags = document.querySelector("#clientRedFlags");
+const pickClientIdentityButton = document.querySelector("#pickClientIdentityButton");
 const saveClientButton = document.querySelector("#saveClientButton");
 const linkClientButton = document.querySelector("#linkClientButton");
 const unlinkClientButton = document.querySelector("#unlinkClientButton");
@@ -108,6 +109,7 @@ function bindEvents() {
   saveOutcomeEventButton.addEventListener("click", saveOutcomeEvent);
   voidOutcomeEventButton.addEventListener("click", voidSelectedOutcomeEvent);
   clientRecordSelect.addEventListener("change", renderClientFormFromSelection);
+  pickClientIdentityButton.addEventListener("click", pickClientIdentity);
   saveClientButton.addEventListener("click", saveClientRecord);
   linkClientButton.addEventListener("click", linkSelectedClient);
   unlinkClientButton.addEventListener("click", unlinkSelectedClient);
@@ -410,6 +412,23 @@ async function saveClientRecord() {
   }
 }
 
+async function pickClientIdentity() {
+  setStatus("Pick the employer profile link on the active Upwork tab...");
+  setBusy(true);
+  try {
+    const response = await send({ type: "clients:startIdentityPicking" });
+    clientPrimaryKey.value = response.identity.primaryClientKey || "";
+    if (!clientDisplayName.value.trim() && response.identity.displayName) {
+      clientDisplayName.value = response.identity.displayName;
+    }
+    setStatus("Employer identity key extracted");
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function linkSelectedClient() {
   if (!selectedId || !clientRecordSelect.value) return;
   setStatus("Linking client...");
@@ -645,6 +664,7 @@ function renderSummary(opportunity) {
 function renderClient(opportunity) {
   renderClientSelects(opportunity);
   const clientRecord = opportunity?.clientRecord || null;
+  pickClientIdentityButton.disabled = false;
   saveClientButton.disabled = !opportunity;
   linkClientButton.disabled = !opportunity || !clientRecordSelect.value;
   unlinkClientButton.disabled = !opportunity?.clientRecordId;
@@ -1233,6 +1253,7 @@ function setBusy(isBusy) {
   clientDisplayName.disabled = isBusy;
   clientNotes.disabled = isBusy;
   clientRedFlags.disabled = isBusy;
+  pickClientIdentityButton.disabled = isBusy;
   saveClientButton.disabled = isBusy || !selectedId;
   linkClientButton.disabled = isBusy || !selectedId || !clientRecordSelect.value;
   unlinkClientButton.disabled = isBusy || !selectedOpportunity?.clientRecordId;
