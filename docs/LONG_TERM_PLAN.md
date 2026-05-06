@@ -1276,6 +1276,146 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 3. Snapshot retention 的实际清理按钮和压缩/脱敏策略 UI 尚未实现；当前 v0.2 只定义状态并保留数据结构。
 4. 完整 Chrome unpacked extension runtime smoke 仍需人工或专门 Playwright persistent extension context 验证；当前 MCP 测试覆盖 Options UI，不等同于真实扩展上下文。
 
+### 9.9 当前业务闭环、测试缺口和修复依据
+
+本节记录基于当前代码的闭环审计结果。后续完善代码时，必须优先补齐这里列出的真实业务逻辑测试；不能只用静态扫描或 mocked UI 流程替代。
+
+#### 9.9.1 当前已存在的业务闭环
+
+| 业务闭环 | 当前真实入口 | 当前 CRUD 状态 | 当前测试状态 | 结论 |
+| --- | --- | --- | --- | --- |
+| Settings | `settings:get`、`settings:save` | 读、保存/更新；没有 reset/delete | 没有专门测试 | 闭环存在，但缺少保存后读取、API Key 保留和 export 脱敏测试 |
+| Opportunity + Snapshot Capture | `capture:currentPage`、`opportunities:listSummary`、`opportunities:get` | capture 创建 Opportunity/Snapshot；list/detail 读取；追加 snapshot 更新 Opportunity | 没有真实 handler 测试 | 核心闭环存在，但 capture 是当前最大未测风险 |
+| Opportunity archive/restore/delete | `opportunities:archive`、`opportunities:restore`、`opportunities:deletePermanent` | archive 软删除；restore 恢复；permanent delete 级联删除关联数据 | 没有真实 handler 测试 | 逻辑存在，但级联删除和列表过滤未被测试保护 |
+| Notes revision | `opportunities:updateNotes`、`notes:update` | 每次保存创建 revision；detail 读取 current revision；没有删除 | 没有真实 handler 测试 | 数据模型存在，但 stale score 判断未实现 |
+| Profile + Score | `score:opportunity` | 调 OpenAI 提取 profile，再评分，创建 `OpportunityProfile` 和 `ScoreResult`，更新 current ids | 只有 adapter fake response 测试；没有完整 score handler 测试 | 评分闭环存在，但没有 fake OpenAI 的端到端业务测试 |
+| Backup / Export / Import | `data:createBackup`、`data:export`、`data:importPreview`、`data:importCommit` | backup 创建备份；export 导出脱敏 settings；preview 校验；commit 备份后替换本地数据并保留当前 API Key | `data:importPreview` 有真实 handler 测试；Options UI 是 mocked runtime | 只有 import preview 被真实覆盖；export/import commit/backup 仍需测试 |
+| Migration | 所有 background message handler 前的 `ensureMigrated()` | 旧 embedded Opportunity 迁移到 v1 分表结构 | 没有 legacy fixture 测试 | 数据安全风险高，必须补旧数据样本测试 |
+| 风险边界 | `scripts/validate_v0_2.mjs` 静态扫描 | 检查自动化高风险 API 和 Upwork 私有 API 文本 | 有静态测试 | 只能证明代码文本没有命中，不能替代扩展运行时 smoke |
+
+#### 9.9.2 已确认测试是否调用真实业务逻辑
+
+当前 `scripts/validate_v0_2.mjs` 已真实调用：
+
+1. `src/shared/adapters.js` 的 `mapRawProfileFields()`。
+2. `src/shared/adapters.js` 的 `normalizeRawScore()`。
+3. background 注册到 `chrome.runtime.onMessage` 的真实 handler，但目前只覆盖 `data:importPreview`。
+4. manifest JSON parse、JS syntax check、风险关键字静态扫描。
+
+当前 MCP / Playwright 已覆盖：
+
+1. Options 页面加载。
+2. storage usage 显示。
+3. export button、import preview button、commit import button 的 UI 流程。
+4. 导出文本不包含 mocked API Key。
+
+MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试注入的是 mocked `chrome.runtime.sendMessage`。因此它只能证明 Options UI 按钮和状态文案流程正确，不能证明 `data:export`、`data:importCommit`、`data:createBackup` 的真实实现正确。
+
+#### 9.9.3 必须新增的真实业务逻辑测试
+
+新增测试必须通过真实 background message handler 调用业务入口。建议在 `scripts/validate_v0_2.mjs` 或拆出的 `scripts/background_harness.mjs` 中统一 mock `chrome.storage.local`、`chrome.tabs.query`、`chrome.scripting.executeScript`、`fetch`，然后发送真实 message。
+
+必须补齐的 case：
+
+1. Settings：
+   - `settings:save` 后 `settings:get` 能读回归一化 settings。
+   - API Key 会 trim。
+   - export 永远不包含真实 API Key。
+   - import commit 必须保留当前本地 API Key，不能被导入文件覆盖为空或旧值。
+
+2. Migration：
+   - legacy `uosc_opportunities` 内嵌 `snapshots`、`extractedProfile`、`scoreResult`、`notes` 时，会迁移成分表数据。
+   - 迁移会创建 backup key。
+   - 迁移幂等：第二次调用任意 handler 不会重复生成 snapshot/profile/score/note。
+   - `draft + snapshots` 迁移为 `captured`，已有 score 迁移为 `scored`。
+
+3. Capture：
+   - 非 `https://www.upwork.com/*` 页面必须拒绝。
+   - Upwork 页面无可读文本必须拒绝。
+   - 新 job 首次 capture 会创建 Opportunity 和 Snapshot。
+   - 同一 jobKey 重复 capture 会追加到同一个 Opportunity。
+   - 用户选择已有 Opportunity 且 jobKey 不一致时必须拒绝。
+   - archived Opportunity 不能追加 snapshot。
+   - `opportunities:listSummary` 不能返回 `Snapshot.text` 原文。
+   - `opportunities:get` 必须返回 snapshots detail。
+
+4. Notes：
+   - 保存 notes 会创建新 `OpportunityNoteRevision`。
+   - detail 只显示当前 revision 文本。
+   - 多次保存 notes 后旧 revision 仍保留。
+   - 若当前 score 的 `notesRevisionId` 不是 current notes revision，UI/detail 必须能标记 score stale。当前尚未实现，必须先补实现再补测试。
+
+5. Score：
+   - 没有 API Key 时 `score:opportunity` 必须拒绝。
+   - 没有 snapshots 时必须拒绝。
+   - fake OpenAI 返回 profile 和 score 时，真实 `score:opportunity` 会创建 `OpportunityProfile`、`ScoreResult`，更新 Opportunity 为 `scored`。
+   - OpenAI score 超过范围时会 clamp 到 0-100，dimension score/confidence 也会 clamp。
+   - OpenAI 返回 invalid JSON 或 HTTP error 时不能写入半成品 profile/score。
+
+6. Archive / Restore / Permanent Delete：
+   - archive 后默认 list 不返回该 Opportunity。
+   - restore 后 status 根据是否有 score 回到 `scored` 或 `captured`。
+   - permanent delete 会删除 Opportunity、Snapshots、Profiles、Scores、Notes。
+   - permanent delete 不应删除其他 Opportunity 的关联数据。
+
+7. Backup / Export / Import：
+   - `data:createBackup` 会写入 backup key，并更新 meta。
+   - `data:export` 的 `manifest.entityCounts` 与真实数据数量一致。
+   - `data:importPreview` 拒绝未知顶层 key、缺 required field、未知 entity field、坏引用、错误 schemaVersion。
+   - `data:importCommit` 会先 backup，再替换业务数据，并保留当前 API Key。
+
+#### 9.9.4 已确认潜在问题和修复方案
+
+1. 测试覆盖不足。
+   - 问题：当前只有 import preview 通过真实 background handler 测过，大多数 CRUD 只存在代码实现，没有回归测试。
+   - 修复：建立 background harness，以真实 message handler 为唯一入口补齐 9.9.3 的 case。
+
+2. Migration 无样本测试。
+   - 问题：迁移影响长期本地数据，失败会导致旧数据丢失、重复或引用断裂。
+   - 修复：新增 legacy fixture，验证迁移前 backup、迁移后分表、幂等和引用完整性。
+
+3. Capture 无运行时测试。
+   - 问题：capture 涉及 active tab、host 限制、DOM 注入、jobKey 合并、snapshot 写入，是当前核心入口。
+   - 修复：mock `tabs.query` 和 `scripting.executeScript`，通过 `capture:currentPage` 真实 handler 测成功和失败路径。
+
+4. Score 持有 storage lock 等待网络。
+   - 问题：`scoreOpportunity()` 在 `withStorageLock()` 内调用 OpenAI。网络慢或失败时会阻塞其他 storage 写入。
+   - 修复：先在 lock 内读取稳定快照并记录 scoring 状态，释放 lock 后调用 OpenAI，最后再用 lock 写回；写回时校验 Opportunity 仍存在且 revision 未冲突。
+
+5. Score stale 未实现。
+   - 问题：ScoreResult 已保存 `notesRevisionId`，但 notes 更新后 UI/detail 没有明确标记旧 score 已过期。
+   - 修复：在 `hydrateOpportunity()` 或 detail view model 中增加 `scoreStale`，当 `currentScoreResult.notesRevisionId !== currentNotesRevisionId` 时为 true；Side Panel 显示需要重新评分。
+
+6. `data:export` 和 `data:importCommit` 真实逻辑缺测试。
+   - 问题：API Key 脱敏和导入时保留当前 API Key 是安全边界，但目前主要靠代码审查和 UI mock。
+   - 修复：通过真实 handler 测 export 文本不含 API Key，import commit 后 settings.apiKey 仍等于导入前本地值。
+
+7. Archive/restore/permanent delete 无级联测试。
+   - 问题：永久删除若过滤条件错误，可能留下孤儿记录或误删其他 Opportunity 数据。
+   - 修复：构造两个 Opportunity 的关联数据，测试只删除目标 Opportunity 的关联记录。
+
+8. Options UI 的 MCP 测试不是扩展运行时 smoke。
+   - 问题：mocked `chrome.runtime` 不等同于真实 Chrome extension context。
+   - 修复：后续增加 Chrome unpacked extension smoke；至少人工加载扩展验证 Options、Popup、SidePanel、capture、score fake API 或真实 API 前置失败路径。
+
+9. SidePanel 保存 notes 缺少错误处理。
+   - 问题：`saveNotes()` 没有 try/catch，后台失败时 UI 状态不明确。
+   - 修复：给 save notes 加 busy/error handling，并新增失败路径 UI 测试。
+
+10. 未实现业务域不应被误判为完成。
+    - 问题：MyProfile、Portfolio、ProposalDraft、OutcomeEvent、ClientRecord、Analytics、Selector 目前只有 schema key 或文档计划，没有完整业务闭环。
+    - 修复：保持在后续版本实施；每个新业务域进入实现前，必须先写 CRUD contract 和真实 handler 测试清单。
+
+#### 9.9.5 后续修复优先级
+
+1. P0：建立 background harness，并补 migration、capture、export/import commit、archive/delete 的真实 handler 测试。
+2. P0：修复 score 持 lock 等待网络的问题，补 fake OpenAI 完整 `score:opportunity` 测试。
+3. P1：实现 `scoreStale`，补 notes revision 测试。
+4. P1：补 Settings 保存/读取/API Key 安全边界测试。
+5. P1：补 Chrome unpacked extension smoke，确认真实扩展上下文可加载。
+6. P2：补 Snapshot retention UI 和测试。
+7. P2：进入 v0.3 Profile review 前，补 `effectiveProfile`、conflict UI 和字段级 correction 测试。
+
 ## 10. 字段唯一性契约：防止业务字段错位
 
 本节解决一个强约束：每一个业务概念必须只有一个 canonical 数据结构和字段路径。Create、Read、Update、Delete、汇总、长期存储必须指向同一个字段，不能出现“新增写 A 字段、查询读 B 字段、更新改 C 字段、汇总用 D 字段”的错位。
