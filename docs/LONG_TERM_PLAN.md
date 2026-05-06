@@ -7,22 +7,26 @@
 当前版本已经具备：
 
 - Chrome MV3 插件骨架。
-- Options 保存 OpenAI API Key、提取模型、评分模型。
-- Popup 手动触发当前页 DOM 采集。
-- Side Panel 展示 Opportunity、Snapshots、Notes、Score。
-- 本地 `chrome.storage.local` 保存 settings 和 opportunities。
+- Options 保存 OpenAI API Key、提取模型、评分模型，并提供 storage usage、backup、export、import preview、import commit 数据工具。
+- Popup 手动触发当前 Upwork 页面 DOM 采集。
+- Side Panel 展示 Opportunity、Snapshots、Notes、Score，并支持 capture、score、archive、notes 保存。
+- 本地 `chrome.storage.local` 已拆出 `uosc_meta`、`uosc_settings`、`uosc_opportunities`、`uosc_snapshots`、`uosc_opportunity_profiles`、`uosc_score_results`、`uosc_note_revisions`，并预留 MyProfile、Portfolio、Proposal、Outcome、Client、Selector、Analytics storage keys。
+- background 在每个 message handler 前执行 `ensureMigrated()`，支持从旧 embedded `uosc_opportunities` 迁移到 schemaVersion 1 分表结构。
 - OpenAI Responses API 两阶段处理：字段提取和 100 分评分。
-- 不做自动刷新、自动翻页、自动打开页面、自动提交 proposal。
+- Capture 默认严格限制 `https://www.upwork.com/*`，并阻止不同 jobKey 的 snapshot 混入已有 Opportunity。
+- 不做自动刷新、自动翻页、自动打开 Upwork 页面、自动提交 proposal。
 
-当前已确认的基线差异和需要修正的歧义：
+当前已确认的基线差异和需要修正的问题：
 
-- 代码中新建 Opportunity 的状态是 `draft`；长期状态模型已收敛为 `draft` legacy alias、`captured`、`scored`、`archived`。v0.2 必须明确迁移和读取兼容规则。
-- 当前 capture 只判断当前页是否是普通 `http(s)` 页面；非 Upwork 页面也可能被用户手动采集。严格模式下必须只允许 `hostname === "www.upwork.com"`，不能用字符串包含判断。
-- 当前 Side Panel capture 会优先把页面追加到用户选中的 Opportunity；如果当前页 jobKey 和已选 Opportunity 的 jobKey 不一致，必须阻止或要求用户确认，避免把不同岗位的 snapshot 混进同一机会。
+- `draft` 已作为 legacy alias 保留；新 capture 写 `captured`，评分成功写 `scored`。仍需补 migration fixture 和真实 handler 测试证明幂等。
+- Capture 严格 Upwork host 和 jobKey 校验已落地。仍需补 `capture:currentPage` 成功/失败路径的真实 handler 测试。
 - 当前 `score:opportunity` 会自动执行字段提取和评分，尚未给用户确认 AI 字段的机会。后续必须拆分提取、人工确认、评分三个步骤。
-- 当前 `extractedProfile` 是 flat JSON，没有字段级来源、confidence、evidence、selectorId、snapshotId。后续不能直接在 flat 结构上继续叠加人工修正。
+- 当前 `OpportunityProfile.fields` 已有字段级结构和 adapter；但 UI 仍主要展示 legacy score view model，尚未实现字段审核、conflict UI 和 `effectiveProfile`。
+- `score:opportunity` 当前在 storage write lock 内等待 OpenAI 网络响应，后续必须拆成读取快照、网络调用、写回三段。
+- `ScoreResult.notesRevisionId` 已保存，但 notes 更新后的 `scoreStale` 标记尚未实现。
+- Options 的 import UI 文案说 replace，但当前 `data:importCommit` 使用 `chrome.storage.local.set()` 覆盖传入 keys；缺失 keys 不会被自动删除。后续必须确认 import 是 merge 还是 replace，并让文档、UI、代码一致。
 - 早期长期计划只列出数据类型名；本文后续已补 canonical contract、schema version、迁移、导入导出和验证规则。后续实现必须以这些补齐后的章节为准。
-- 当前风险边界是原则描述，后续每个版本都必须有可执行的静态检查和人工验证清单。
+- 当前风险边界已有静态检查；仍需 Chrome unpacked extension smoke 和真实业务 handler 测试。
 
 当前主要代码：
 
@@ -32,8 +36,11 @@
 - `src/popup/popup.js`
 - `src/options/options.html`
 - `src/options/options.js`
+- `src/shared/schema.js`
+- `src/shared/adapters.js`
 - `src/sidepanel/sidepanel.html`
 - `src/sidepanel/sidepanel.js`
+- `scripts/validate_v0_2.mjs`
 - `src/styles.css`
 
 ## 1. 长期需要达到的目标
@@ -110,6 +117,10 @@ outcome.status = "not_applied" | "skipped" | "applied" | "viewed" | "replied" | 
 }
 ```
 
+例外规则：
+
+- Append-only revision / event 记录可以没有 `updatedAt`，例如 `OpportunityNoteRevision`、`OutcomeEvent`。这类记录必须有 `createdAt` 或 `recordedAt`，后续修正必须通过新 revision / correction event / `voidedAt` 表达，不能静默改写事实字段。
+
 AI 或 prompt 生成的长期结果还必须包含：
 
 ```js
@@ -121,6 +132,10 @@ AI 或 prompt 生成的长期结果还必须包含：
   inputProfileVersion
 }
 ```
+
+适用范围：
+
+- `inputProfileVersion` 对 ScoreResult / ProposalDraft 必填；OpportunityProfile 自身没有上游 profile 时写 null 或省略，但必须在 schema/validator 中明确。
 
 必须新增 `uosc_meta` 保存全局 schema version 和 migration 状态。
 
@@ -535,8 +550,7 @@ MyProfile
 PortfolioCase
 Opportunity
 Snapshot
-ExtractedProfile
-UserCorrectedProfile
+OpportunityProfile // replaces legacy ExtractedProfile / UserCorrectedProfile
 ScoreResult
 ProposalDraft
 OutcomeEvent
@@ -558,8 +572,8 @@ uosc_note_revisions
 uosc_my_profile
 uosc_portfolio_cases
 uosc_proposal_drafts
-uosc_client_records
 uosc_outcome_events
+uosc_client_records
 uosc_field_selectors
 uosc_analytics_cache // 可选，只能作为派生缓存
 ```
@@ -878,26 +892,31 @@ v0.9 Selector Assist
 
 ## 8. 审阅补充：仍缺失和歧义点
 
-本节基于当前代码和本文档交叉检查，作为进入 v0.2 前的补齐清单。未确认项必须保留 `[假设]` 标记，不能在实现中静默采用。
+本节基于当前代码和本文档交叉检查。早期条目中已经落地的内容必须标为“已实现”或“已验证”，不能继续作为“当前代码缺口”引用；未确认项必须保留 `[假设]` 或 `[需确认]` 标记，不能在实现中静默采用。
 
 ### 8.1 必须先消除的直接歧义
 
-1. Capture 范围和权限模型仍不一致。
-   - 证据：当前 `manifest.json` 只声明 `https://www.upwork.com/*` 和 OpenAI host permission，但代码只校验 `http(s)`，非 Upwork 页面会被标记为 `platform: unknown`。
-   - 证据：当前代码用 `sourceUrl.includes("upwork.com")` 推断 platform，可能误判非官方 host。
-   - 证据：Side Panel capture 会传入当前选中的 opportunityId；background 会优先追加到该 Opportunity。当前页 jobKey 和已有 Opportunity jobKey 不一致时，存在混入错误 snapshot 的风险。
-   - Chrome 官方文档说明 `activeTab` 只在用户调用扩展后临时授予当前 tab 权限；`chrome.storage.local` 默认也有容量上限，长期 snapshot 不能无限堆积。
-   - 修复建议：v0.2 默认采用严格模式，只允许 `hostname === "www.upwork.com"`。扩展研究模式必须等 `allowedHosts`、隐私提示、权限失败提示、导入导出风险说明都完成后再开启。capture 追加已有 Opportunity 时必须校验 jobKey 一致，无法确认时要求用户显式确认。
+1. Capture 范围和权限模型。
+   - 状态：`[已实现，待真实 handler 测试]`。
+   - 证据：manifest 只声明 `https://www.upwork.com/*` 和 OpenAI host permission；background 现在校验 `tab.url` 和 injected `result.url` 都必须是 `https:` 且 `hostname === PLATFORM_HOSTS.upwork`。
+   - 证据：platform 推断使用 host 白名单，不再用 `sourceUrl.includes("upwork.com")`。
+   - 证据：如果当前页 jobKey 与已有 Opportunity jobKey 不一致，`capture:currentPage` 会拒绝追加。
+   - 剩余修复：补 `capture:currentPage` 的真实 handler 测试，覆盖非 Upwork、无文本、新建、追加、jobKey mismatch、archived 拒绝。
 
-2. `draft` / `captured` 的最终语义还没有落到迁移规则。
-   - 证据：当前新建 Opportunity 在 capture 成功后仍写入 `status: "draft"`，长期计划又新增 `captured`。
-   - 修复建议：`draft` 仅作为 legacy alias 保留；v0.2 迁移时把 `draft + snapshots.length > 0 + no scoreResult` 转为 `captured`，把 `scoreResult != null` 转为 `scored`。读取层必须继续兼容旧 `draft`。
+2. `draft` / `captured` 的最终语义。
+   - 状态：`[已实现，待 migration fixture 测试]`。
+   - 证据：新 capture 写入 `status: "captured"`；评分成功写入 `status: "scored"`；旧 `draft` 经 `normalizeOpportunityStatus()` 读为 `captured`。
+   - 剩余修复：补 legacy fixture，验证 `draft + snapshots + no scoreResult -> captured`、`scoreResult != null -> scored`，并验证迁移幂等。
 
-3. `ProfileField` 早期单 `source` 示例不足以表达同一字段的多来源冲突。
-   - 修复建议：以 10.3 的 `sources[] + effectiveSource + conflicts[]` 为准。`value` 只表示当前有效值，不能覆盖原始 AI、selector、人工值。
+3. `ProfileField` 多来源结构。
+   - 状态：`[部分实现]`。
+   - 证据：OpenAI raw profile 已通过 `src/shared/adapters.js` 进入 `OpportunityProfile.fields.<fieldKey>`，字段包含 `sources[]`、`effectiveSource`、`confidence`、`evidenceRefs`、`correctedAt`、`correctedBy`。
+   - 剩余修复：人工 correction、selector source、conflict UI、`effectiveProfile` 尚未实现，归入 v0.3。
 
 4. 评分和 proposal 的版本常量必须在实现中固化。
-   - 修复建议：以 10.4 的版本常量为准。任何长期结果都保存这些版本或明确写 `not_applicable`，不允许只保存 model。
+   - 状态：`[评分已实现，proposal 未实现]`。
+   - 证据：`src/shared/schema.js` 已有 `PROMPT_VERSIONS`；`OpportunityProfile.scoreVersion` 写 `"not_applicable"`；`ScoreResult.scoreVersion` 写 `score_rules_v1`。
+   - 剩余修复：ProposalDraft adapter 和 `ProposalDraftStatus` 放到 v0.5；v0.2 不要求 proposal 业务枚举进入运行时代码。
 
 5. Outcome 事件流必须按枚举、payload 和派生规则实现。
    - 修复建议：以 10.3 的 `OutcomeEvent.eventType`、payload 契约和状态派生规则为准。终态之后如果用户继续记录事件，必须显示“状态被新事件覆盖”的历史，而不是删除旧事件。
@@ -912,11 +931,14 @@ v0.9 Selector Assist
    - 修复建议：proposal 输出中的每条 proof/claim 必须带 `sourceRefs[]`，来源限定为 opportunity field、snapshot evidence、My Profile、Portfolio Case、Notes。`unsupportedClaims.length > 0` 时 UI 必须显示警告，复制按钮仍可用但必须让用户看见风险。
 
 9. Storage 长期容量和写入并发未设计。
-   - 证据：当前所有 Opportunity 作为一个数组整体读写，snapshot text 单条最高 70000 chars。
-   - 修复建议：v0.2 增加 `storage.getBytesInUse()` 容量提示、snapshot retention 策略、写入 revision 或简单 mutex，避免 popup / sidepanel 同时写入时丢更新。
+   - 状态：`[部分实现]`。
+   - 证据：Options 已能读取 `chrome.storage.local.getBytesInUse(null)` 并显示容量；snapshot retention state 已定义；background 已有 `storageWriteQueue` 简单写入队列。
+   - 剩余修复：snapshot redacted/compacted UI 未实现；score 仍在 storage lock 内等待 OpenAI 网络响应，需要拆分。
 
 10. Import / Export 的隐私边界不完整。
-    - 修复建议：默认不导出 OpenAI API Key；导出 My Profile、Portfolio、snapshots 时必须在 UI 标明包含个人资料和页面文本。Import 必须先校验 `schemaVersion`、创建备份，再写入 storage。
+    - 状态：`[部分实现，存在 import 语义歧义]`。
+    - 证据：`data:export` 会把 `settings.apiKey` 置空；`data:importPreview` 会校验 schemaVersion、entity shape 和引用；`data:importCommit` 会先 backup，并保留当前本地 API Key。
+    - 剩余修复：UI 文案说 replace，但当前实现是对导入 payload 中的 keys 执行 `chrome.storage.local.set()`，不会删除缺失 keys。必须确认 import 是 merge 还是 replace；建议采用 replace managed keys，并在 commit 前删除受管理 storage keys 后再写入。
 
 ### 8.2 可直接采用的默认决策
 
@@ -925,9 +947,9 @@ v0.9 Selector Assist
 1. `[已确认]` Capture 默认严格限制 Upwork：`new URL(tab.url).hostname === "www.upwork.com"`。其他 host 暂不进入 v0.2。
 2. `[已确认]` 新数据不再写 `draft`；新 capture 后状态为 `captured`，评分成功后为 `scored`。
 3. `[已确认]` 旧 `draft` 迁移规则：`draft + snapshots.length > 0 + no scoreResult -> captured`；`scoreResult != null -> scored`；读取层继续兼容旧 `draft`。
-4. `[已确认]` v0.2 测试先用 plain Node 脚本和静态扫描，不引入 Jest / Vitest。
+4. `[已确认]` v0.2 测试先用 plain Node 脚本和静态扫描，不引入 Jest / Vitest；但当前覆盖不足，必须升级为真实 background handler harness。
 5. `[已确认]` v0.2 不新增 proposal、analytics、selector picking 等业务功能，只做 schema、migration、storage 拆分、list/detail、archive、API Key 边界和风险检查。
-6. `[假设]` 原始 snapshot text 默认保留，但显示容量占用；用户可以手动清理为 `redacted` 或 `compacted`。
+6. `[已确认]` 原始 snapshot text 当前默认保留，Options 显示容量占用；`redacted` / `compacted` 只定义状态，清理 UI 尚未实现。
 7. `[假设]` Analytics 校准建议最小样本：`applied >= 20`；不足时只展示描述性统计。
 8. `[假设]` Proposal 默认英文、短篇、直接、以问题和证据为中心，不承诺未验证结果。
 9. `[假设]` My Profile / Portfolio 支持导入、导出、一键清空，但不导出 API Key。
@@ -936,28 +958,43 @@ v0.9 Selector Assist
 
 v0.2 不是功能版本，目标是把长期数据基础打稳。实现时必须把这些规格落到代码、测试和 migration：
 
-1. `schemaVersion = 1` 的完整 storage contract。
-2. `Opportunity.status`、`OutcomeEvent.eventType`、`ProposalDraft.status` 的枚举表。
-3. `ProfileField` 多来源结构和 conflict 展示规则。
+1. `schemaVersion = 1` 的 core storage contract。
+2. `Opportunity.status`、`SnapshotRetentionState`、Prompt / score version 常量表。
+3. `ProfileField` 多来源数据结构；conflict 展示规则只写入设计，UI 进入 v0.3。
 4. v0.1 -> v0.2 migration 规则，包括备份 key、幂等性、失败回滚策略。
-5. Snapshot retention 策略：`full`、`redacted`、`compacted`、`deleted_reference_only`。
-6. Prompt / score version 常量表。
-7. Risk static check 命令清单。
-8. 手动验证 checklist：Options 保存、capture、notes、score、旧数据读取、容量提示。
+5. Snapshot retention 状态：`full`、`redacted`、`compacted`、`deleted_reference_only`；清理 UI 不属于当前 v0.2 已完成范围。
+6. Risk static check 命令清单。
+7. 手动验证 checklist：Options 保存、capture、notes、score、旧数据读取、容量提示。
+8. `OutcomeEvent.eventType`、`ProposalDraft.status` 只在文档 contract 中保留，运行时代码分别进入 v0.6 和 v0.5。
 
 ### 8.4 v0.2 实现完成定义
 
-v0.2 只有满足以下条件才算完成：
+v0.2 完成状态必须拆成 `已实现`、`已验证`、`待验证/待实现`。截至当前代码，不应简单宣称 v0.2 全部完成。
+
+已实现：
 
 1. 不新增 proposal、analytics、selector picking 等新功能。
-2. 旧 `uosc_opportunities` 能无损读取，并能迁移到 `schemaVersion = 1`。
-3. 迁移前自动写入本地备份 key，迁移可重复执行且不会重复修改同一条记录。
-4. Capture 域名策略在代码、UI、README、本文档中一致。
-5. 所有长期生成物都保存 model、promptVersion、scoreVersion 或明确标记“不适用”。
-6. API Key 不被 export；引入 content script 后，content script 不能读取包含 API Key 的 settings storage。
-7. Risk static check 能检查 `setInterval`、`chrome.alarms`、`chrome.tabs.create`、`chrome.tabs.update`、`.click()`、`.submit()`、输入事件派发、Upwork `fetch` / `XMLHttpRequest`。
-8. `manifest.json` 可被 JSON parser 解析，所有 JS 文件通过 syntax check。
-9. OpenAI 调用可用 fake response fixture 验证 JSON schema 解析，不依赖真实 API 才能跑基础验证。
+2. `schemaVersion = 1` core storage keys、migration、list/detail、archive、storage usage、backup、export/import preview/commit 已有代码。
+3. Capture 域名策略已在代码、README、本文档中收敛为严格 Upwork。
+4. Profile/Score 生成物保存 model、promptVersion、scoreVersion 或 `"not_applicable"`。
+5. API Key export 脱敏和 `storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" })` 已有代码。
+6. Risk static check、manifest JSON parse、JS syntax check 已进入 `scripts/validate_v0_2.mjs`。
+
+已验证：
+
+1. `manifest.json` 可被 JSON parser 解析，所有 JS 文件通过 syntax check。
+2. adapter fake response 覆盖 profile mapping 和 score clamp。
+3. `data:importPreview` 通过真实 background handler 覆盖有效导入、未知顶层 key、缺 required field、坏引用。
+4. Options 数据 UI 通过 MCP / Playwright mocked runtime 验证；该验证不等同于真实扩展上下文。
+
+待验证/待实现：
+
+1. 旧 `uosc_opportunities` migration 还缺 legacy fixture，未证明幂等。
+2. Capture、archive/restore/permanent delete、notes、settings、export、import commit、score 完整业务闭环还缺真实 handler 测试。
+3. score 仍在 storage lock 内等待 OpenAI 网络响应，需要拆分。
+4. notes 更新后的 `scoreStale` 未实现。
+5. Snapshot retention 清理 UI 未实现。
+6. Chrome unpacked extension runtime smoke 未完成。
 
 ### 8.5 参考依据
 
@@ -988,95 +1025,122 @@ rg -n "questions_to_ask|total_score|decision_summary|hard_red_flags|missing_info
 
 ## 9. 数据流审阅：CRUD、汇总和长期保存
 
-本节专门审阅数据从来源、写入、读取、修改、删除、汇总使用到长期保存的完整链路。结论：当前 v0.1 数据流简单但过度集中；长期计划已经列出部分模型，但还缺少事实表归属、级联删除、汇总缓存失效、版本历史和读取投影规则。
+本节专门审阅数据从来源、写入、读取、修改、删除、汇总使用到长期保存的完整链路。结论：当前代码已经从 v0.1 的嵌套数组模型迁移到 v0.2 core 分表模型，但测试覆盖还没有跟上；长期计划仍需要补齐未实现事实表、级联规则、缓存失效、版本历史和读取投影规则。
 
-### 9.1 当前 v0.1 实际数据流
+### 9.1 当前 v0.2 core 实际数据流
 
-当前代码只有两个长期 storage key：
+当前代码的长期 storage keys 已由 `src/shared/schema.js` 统一定义：
 
 ```js
+uosc_meta
 uosc_settings
 uosc_opportunities
+uosc_snapshots
+uosc_opportunity_profiles
+uosc_score_results
+uosc_note_revisions
+uosc_my_profile
+uosc_portfolio_cases
+uosc_proposal_drafts
+uosc_outcome_events
+uosc_client_records
+uosc_field_selectors
+uosc_analytics_cache
 ```
 
 实际流向：
 
 1. Settings：
    - 来源：Options 表单。
-   - 写入：`settings:save` 合并默认值后写入 `uosc_settings`。
+   - 写入：`settings:save` 合并默认值后写入 `uosc_settings`，并 bump `uosc_meta.storageRevision`。
    - 读取：`settings:get` 返回完整 settings；`score:opportunity` 读取 API key、模型、reasoning effort。
-   - 缺口：没有 reset、export/import、API key 排除导出规则、settings schemaVersion。
+   - 已实现：settings 带 `schemaVersion` 和 `updatedAt`；export 会清空 `settings.apiKey`；import commit 会保留当前本地 API Key。
+   - 缺口：没有 reset；没有 settings save/get 的真实 handler 测试。
 
 2. Capture：
    - 来源：Popup / Side Panel 用户点击 `Capture current page`。
-   - 写入：background 读取 active tab，注入 `captureVisibleDom()`，生成 snapshot，并追加到 `opportunity.snapshots[]`。
-   - 合并规则：如果 URL 中能提取 Upwork jobKey，只能追加到相同 jobKey 的 Opportunity；如果用户传入 opportunityId 但 jobKey 不一致，必须阻止或显式确认。无法提取 jobKey 时只能追加到用户明确选择的 Opportunity。
-   - 缺口：没有 snapshot 单独 CRUD、没有 retention 状态、没有 snapshot 删除/脱敏/压缩、没有 capture source 记录到可审计事件。
+   - 写入：background 读取 active tab，校验 `https://www.upwork.com`，注入 `captureVisibleDom()`，生成 `Snapshot` 写入 `uosc_snapshots`，并把 snapshot id 追加到 `Opportunity.snapshotIds`。
+   - 合并规则：如果 URL 中能提取 Upwork jobKey，自动追加到相同 jobKey 的非 archived Opportunity；如果用户传入 opportunityId 且 jobKey 不一致，当前实现直接拒绝。
+   - 已实现：strict host、jobKey mismatch 拒绝、archived Opportunity 拒绝追加、snapshot hash、retentionState。
+   - 缺口：没有 snapshot 单独 CRUD；没有 redacted/compacted 清理 UI；没有 capture 真实 handler 测试。
 
 3. Opportunity：
    - 来源：第一次 capture 自动创建。
-   - 写入：`uosc_opportunities` 数组整体重写。
-   - 读取：Popup 和 Side Panel 的 `opportunities:list` 都读取完整 Opportunity 对象。
-   - 修改：capture 追加 snapshot；notes 覆盖；score 覆盖 extractedProfile 和 scoreResult。
-   - 删除：Side Panel `Delete` 直接 hard delete，过滤数组后重写 storage。
-   - 缺口：长期计划要 archive，但当前是 hard delete；没有 revision，Popup 和 Side Panel 同时写入可能互相覆盖。
+   - 写入：`uosc_opportunities` 保存身份字段和 current 指针，不再嵌入 snapshot 原文。
+   - 读取：Popup 和 Side Panel 默认用 `opportunities:listSummary`；详情页用 `opportunities:get` hydrate snapshots、notes、score。
+   - 修改：capture 更新 `snapshotIds` 和 `updatedAt`；score 更新 `currentProfileId`、`currentScoreResultId`、status；notes 更新 `currentNotesRevisionId`。
+   - 删除：UI 默认 `opportunities:archive`；内部保留 `opportunities:deletePermanent` 并级联删除 snapshots/profiles/scores/notes。
+   - 缺口：archive/restore/permanent delete 仍缺真实 handler 测试；permanent delete 还没有 UI 暴露和风险确认文案。
 
 4. ExtractedProfile / ScoreResult：
    - 来源：`score:opportunity`。
-   - 写入：每次 score 都重新调用 extract，再调用 score，最后覆盖 `opportunity.extractedProfile` 和 `opportunity.scoreResult`。
-   - 读取：Side Panel 只展示 scoreResult，不展示 extractedProfile。
-   - 缺口：没有 score history、没有 profile review、没有 input hash、没有 notes 修改后的 stale 标记、没有 promptVersion/scoreVersion。
+   - 写入：每次 score 创建新的 `OpportunityProfile` 和 `ScoreResult`，Opportunity 只更新 current id。
+   - 读取：Side Panel detail 通过 legacy score view model 展示当前 score。
+   - 已实现：ScoreResult append-only、model、promptVersion、scoreVersion、inputSnapshotIds、inputProfileVersion、notesRevisionId、profileReviewed。
+   - 缺口：没有 profile review UI；没有 score history UI；没有 input hash；没有 notes 修改后的 `scoreStale`；score 仍在 storage lock 内等待 OpenAI。
 
 5. Notes：
    - 来源：Side Panel 文本框。
-   - 写入：`opportunities:updateNotes` 覆盖 `opportunity.notes`。
+   - 写入：`opportunities:updateNotes` / `notes:update` 每次创建新的 `OpportunityNoteRevision`，并更新 `Opportunity.currentNotesRevisionId`。
    - 使用：下次 scoring prompt 会包含 notes。
-   - 缺口：notes 改动不会让已有 ScoreResult 标记为 stale；没有 notes history；无法知道某次 score 使用的是哪版 notes。
+   - 已实现：notes revision 历史保留，ScoreResult 保存使用的 `notesRevisionId`。
+   - 缺口：notes 改动不会让已有 ScoreResult 标记为 stale；Side Panel `saveNotes()` 缺 try/catch 错误处理。
 
-### 9.2 当前数据流的矛盾点
+6. Backup / Export / Import：
+   - 来源：Options 数据工具。
+   - 写入：`data:createBackup` 写入 `uosc_backup_v0_to_v1_*`；`data:importCommit` 先 backup，再写入导入数据并保留当前 API Key。
+   - 读取：`data:getStorageUsage`、`data:export`、`data:importPreview`。
+   - 已实现：export 脱敏 API Key；import preview 校验 schemaVersion、known top-level keys、core entity shape、引用完整性。
+   - 缺口：import commit 当前是 `set()` 覆盖导入 payload 中的 keys，不会删除 payload 缺失的旧 keys；必须确认 merge/replace 语义并修正 UI 和代码。
+
+### 9.2 历史矛盾的当前状态
 
 1. 长期数据库目标和 hard delete 矛盾。
-   - 当前 `opportunities:delete` 是物理删除。
-   - 长期计划要求追踪、复盘、Analytics、ClientRecord 历史；这些都需要 archive 优先。
-   - 修复建议：默认 `opportunities:archive`，另设 `opportunities:deletePermanent`，且 permanent delete 必须说明会删除 snapshots、scores、proposals、outcome links。
+   - 状态：`[已实现 core，待测试]`。
+   - 当前 UI 默认 archive，内部保留 permanent delete。仍需补级联删除测试和 UI 风险说明。
 
 2. 列表读取和长期 snapshot 保存矛盾。
-   - 当前 `opportunities:list` 返回完整对象，包含 snapshots 原文。
-   - Popup 只需要 id/title/score label，却会拿到完整文本。
-   - 修复建议：新增 `opportunities:listSummary`，只返回 id、title、status、updatedAt、snapshotCount、currentScore。详情页用 `opportunities:get` 再取完整数据。
+   - 状态：`[已实现 core，待测试]`。
+   - 当前 list summary 不返回 snapshot text；详情页才 hydrate snapshots。仍需补 list/detail contract 测试。
 
 3. 单一 `scoreResult` 和版本化 Analytics 矛盾。
-   - Analytics 要按 scoreVersion/promptVersion 分组。
-   - 如果每次重新评分都覆盖 `scoreResult`，旧版本分数和当时决策会丢失。
-   - 修复建议：ScoreResult 必须 append-only，使用 `currentScoreResultId` 指向当前结果。可以存在 `uosc_score_results`，或至少 `opportunity.scoreResults[]`。
+   - 状态：`[已实现 core，待测试]`。
+   - 当前 ScoreResult append-only，Opportunity 用 `currentScoreResultId` 指向当前结果。仍需补 fake OpenAI 完整 `score:opportunity` 测试。
 
 4. `proposalDrafts[]` 嵌套在 Opportunity，但 OutcomeEvent 独立存储，数据归属不一致。
+   - 状态：`[文档已收敛，业务未实现]`。
    - Proposal 是长期事实，也需要版本、编辑历史、复制状态、模板统计。
-   - 修复建议：长期方案改为 `uosc_proposal_drafts` 独立事实表，Opportunity 只保存 `currentProposalDraftId` 或 draft count。
+   - 修复建议：v0.5 使用 `uosc_proposal_drafts` 独立事实表，Opportunity 只保存 `currentProposalDraftId` 或 draft count。
 
 5. Snapshot 被嵌套保存，但 selector、evidence、profile field 都要引用 snapshotId。
-   - 嵌套结构可以引用，但不利于 retention、按 snapshot 删除、导入校验和容量管理。
-   - 修复建议：新增 `uosc_snapshots`，或至少在 storage 层提供 snapshot repository，禁止业务代码直接遍历和修改嵌套数组。
+   - 状态：`[已实现 core，retention UI 待实现]`。
+   - 当前已新增 `uosc_snapshots`；仍需 snapshot retention 操作、evidenceRef 使用和相关测试。
 
 6. Outcome event sourcing 和 `outcome:update/delete` 矛盾。
+   - 状态：`[业务未实现]`。
    - 如果 OutcomeEvent 是事实来源，直接 update/delete 会破坏审计链。
    - 修复建议：取消普通 update/delete，改为 `outcome:appendEvent`、`outcome:voidEvent`、`outcome:appendCorrection`。UI 可以显示为编辑，但底层必须保留修正记录。
 
 7. ClientRecord 汇总字段和 Opportunity 删除/拆分规则缺失。
+   - 状态：`[业务未实现]`。
    - ClientRecord 展示 seen count、average score、previous outcomes。
    - 如果 Opportunity archive/delete、client split/merge 后不重算，汇总会污染。
    - 修复建议：ClientRecord 不保存不可追溯的最终统计，只保存 identity、notes、merge/split history；统计从 Opportunity、ScoreResult、OutcomeEvent 派生或带 cache invalidation。
 
 8. My Profile / Portfolio 被评分和 proposal 使用，但没有输入版本锁定。
+   - 状态：`[业务未实现]`。
    - 如果用户修改或清空 My Profile，旧 score/proposal 仍需要知道当时使用了哪版 profile。
    - 修复建议：`MyProfile` 和 `PortfolioCase` 必须有 version；ScoreResult / ProposalDraft 保存 `inputProfileVersion` 和 `selectedPortfolioCaseRefs`。
 
 9. AnalyticsSummary 类型存在，但没有事实来源、缓存 key 和失效规则。
+   - 状态：`[业务未实现]`。
    - 修复建议：Analytics 默认实时派生；如缓存，必须存 `uosc_analytics_cache`，并记录 `builtFromRevision`、`filters`、`scoreVersion`、`promptVersion`、`createdAt`。任何 Opportunity、ScoreResult、OutcomeEvent、ProposalDraft 变动都使相关 cache 失效。
 
 10. Import / Export 和 cascade 关系缺失。
-    - 如果导入 Opportunity 但没有导入 snapshots/scores/outcomes，会形成断链。
-    - 修复建议：Export manifest 必须列出包含的 entity types、counts、schemaVersion、createdAt。Import 必须先做 referential integrity check，再写入。
+    - 状态：`[部分实现，仍有语义缺口]`。
+    - 当前 import preview 会检查 core entity 引用完整性。
+    - 缺口：未来实体 key 允许出现在 import data，但未实现 shape validator；当前应拒绝未实现实体的非空导入，或补完整 validator。
+    - 缺口：import commit 是 merge 还是 replace 尚不明确；建议采用 replace managed keys。
 
 ### 9.3 推荐的长期事实表归属
 
@@ -1245,22 +1309,22 @@ analytics:invalidateCache
 
 v0.2 至少完成以下数据流修复，不新增业务功能：
 
-1. 把 `opportunities:list` 拆成 summary 和 detail 两类读取，避免列表页读取 snapshot 原文。
-2. 新增 `uosc_meta`，记录 schemaVersion、storageRevision、lastMigrationAt、lastBackupAt。
-3. 新增 migration，把旧 Opportunity 补齐 schemaVersion、status、snapshot ids、score ids 的兼容字段。
-4. 新增 storage usage 读取和容量提示。
-5. 将 hard delete 改为 archive，保留 permanent delete 的内部实现但 UI 默认不暴露。
-6. ScoreResult 增加 id、model、promptVersion、scoreVersion、inputSnapshotIds、inputProfileVersion、notesRevision。
-7. Notes 增加 revision 或至少 `notesUpdatedAt`，score 后如果 notes 更新，UI 标记 score stale。
-8. 明确 snapshot retention 状态：`full`、`redacted`、`compacted`、`deleted_reference_only`。
-9. Export / Import preview 必须做 entity count 和引用完整性检查。
-10. Analytics 在 v0.2 不实现 UI，但先定义只从事实表派生，不能从缓存反推事实。
-11. Capture 严格校验 host 和 jobKey，避免非 Upwork 页面或不同 job 混入已有 Opportunity。
-12. 保护 API Key storage；新增 content script 前必须验证 content script 不能读取 `apiKey`。
+1. `[已实现，待测试]` 把 `opportunities:list` 拆成 summary 和 detail 两类读取，避免列表页读取 snapshot 原文。
+2. `[已实现，待测试]` 新增 `uosc_meta`，记录 schemaVersion、storageRevision、lastMigrationAt、lastBackupAt。
+3. `[已实现，待测试]` 新增 migration，把旧 Opportunity 补齐 schemaVersion、status、snapshot ids、score ids 的兼容字段。
+4. `[已实现，已做 UI mock 验证]` 新增 storage usage 读取和容量提示。
+5. `[已实现，待测试]` 将 hard delete 改为 archive，保留 permanent delete 的内部实现但 UI 默认不暴露。
+6. `[已实现，待完整 score handler 测试]` ScoreResult 增加 id、model、promptVersion、scoreVersion、inputSnapshotIds、inputProfileVersion、notesRevision。
+7. `[部分实现]` Notes 已增加 revision；score 后 notes 更新的 `scoreStale` UI/detail 标记未实现。
+8. `[已实现状态定义，UI 未实现]` 明确 snapshot retention 状态：`full`、`redacted`、`compacted`、`deleted_reference_only`。
+9. `[部分实现]` Export / Import preview 已做 entity count 和 core 引用完整性检查；未来实体 validator 和 import commit replace 语义未完成。
+10. `[文档已定义，业务未实现]` Analytics 在 v0.2 不实现 UI，但先定义只从事实表派生，不能从缓存反推事实。
+11. `[已实现，待测试]` Capture 严格校验 host 和 jobKey，避免非 Upwork 页面或不同 job 混入已有 Opportunity。
+12. `[已实现，待扩展运行时验证]` 保护 API Key storage；新增 content script 前必须验证 content script 不能读取 `apiKey`。
 
 ### 9.8 v0.2 当前实施状态
 
-截至当前代码，v0.2 数据基础已落地：
+截至当前代码，v0.2 数据基础的“代码实现”已落地，但“真实业务闭环验证”尚未完成：
 
 1. `src/shared/schema.js` 统一导出 schema、storage key、状态枚举、prompt / score version 常量。
 2. `src/shared/adapters.js` 统一承接 OpenAI snake_case response 到 canonical storage 字段的映射和分数 clamp。
@@ -1269,12 +1333,15 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 5. `scripts/validate_v0_2.mjs` 已覆盖 JS syntax、风险静态扫描、adapter fake response、import validation 的有效/失败路径。
 6. MCP / Playwright 已用 mocked `chrome.runtime` 验证 Options 数据 UI 的导出、预览导入、确认导入流程。
 
-仍未进入 v0.2 的内容：
+仍未进入 v0.2 或仍未验证的内容：
 
 1. Profile 字段人工确认、字段冲突 UI、`effectiveProfile` 是 v0.3。
 2. ProposalDraft adapter 和 proposal fixture 是 v0.5，不能放进 v0.2 验收。
 3. Snapshot retention 的实际清理按钮和压缩/脱敏策略 UI 尚未实现；当前 v0.2 只定义状态并保留数据结构。
 4. 完整 Chrome unpacked extension runtime smoke 仍需人工或专门 Playwright persistent extension context 验证；当前 MCP 测试覆盖 Options UI，不等同于真实扩展上下文。
+5. `[需确认]` Import commit 的业务语义：当前代码更接近 merge/overwrite provided keys，UI 文案写 replace。建议确认后统一为“replace managed keys”，并让代码先清理受管理 keys 再写入导入数据。
+6. 未实现未来实体的非空导入处理：当前 top-level key 允许所有 `STORAGE_KEYS`，但 validator 只覆盖 core entities。建议 v0.2 暂时拒绝未实现实体的非空导入。
+7. Chrome 扩展发布版本仍是 `manifest.version = 0.1.0`；计划版本 v0.2 和扩展发布版本是否绑定需要明确。
 
 ### 9.9 当前业务闭环、测试缺口和修复依据
 
@@ -1289,7 +1356,7 @@ v0.2 至少完成以下数据流修复，不新增业务功能：
 | Opportunity archive/restore/delete | `opportunities:archive`、`opportunities:restore`、`opportunities:deletePermanent` | archive 软删除；restore 恢复；permanent delete 级联删除关联数据 | 没有真实 handler 测试 | 逻辑存在，但级联删除和列表过滤未被测试保护 |
 | Notes revision | `opportunities:updateNotes`、`notes:update` | 每次保存创建 revision；detail 读取 current revision；没有删除 | 没有真实 handler 测试 | 数据模型存在，但 stale score 判断未实现 |
 | Profile + Score | `score:opportunity` | 调 OpenAI 提取 profile，再评分，创建 `OpportunityProfile` 和 `ScoreResult`，更新 current ids | 只有 adapter fake response 测试；没有完整 score handler 测试 | 评分闭环存在，但没有 fake OpenAI 的端到端业务测试 |
-| Backup / Export / Import | `data:createBackup`、`data:export`、`data:importPreview`、`data:importCommit` | backup 创建备份；export 导出脱敏 settings；preview 校验；commit 备份后替换本地数据并保留当前 API Key | `data:importPreview` 有真实 handler 测试；Options UI 是 mocked runtime | 只有 import preview 被真实覆盖；export/import commit/backup 仍需测试 |
+| Backup / Export / Import | `data:createBackup`、`data:export`、`data:importPreview`、`data:importCommit` | backup 创建备份；export 导出脱敏 settings；preview 校验；commit 备份后按导入 payload 覆盖对应 keys 并保留当前 API Key | `data:importPreview` 有真实 handler 测试；Options UI 是 mocked runtime | 只有 import preview 被真实覆盖；export/import commit/backup 仍需测试；replace/merge 语义需确认 |
 | Migration | 所有 background message handler 前的 `ensureMigrated()` | 旧 embedded Opportunity 迁移到 v1 分表结构 | 没有 legacy fixture 测试 | 数据安全风险高，必须补旧数据样本测试 |
 | 风险边界 | `scripts/validate_v0_2.mjs` 静态扫描 | 检查自动化高风险 API 和 Upwork 私有 API 文本 | 有静态测试 | 只能证明代码文本没有命中，不能替代扩展运行时 smoke |
 
@@ -1362,7 +1429,7 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
    - `data:createBackup` 会写入 backup key，并更新 meta。
    - `data:export` 的 `manifest.entityCounts` 与真实数据数量一致。
    - `data:importPreview` 拒绝未知顶层 key、缺 required field、未知 entity field、坏引用、错误 schemaVersion。
-   - `data:importCommit` 会先 backup，再替换业务数据，并保留当前 API Key。
+   - `data:importCommit` 会先 backup，再覆盖导入 payload 中包含的 storage keys，并保留当前 API Key。
 
 #### 9.9.4 已确认潜在问题和修复方案
 
@@ -1406,6 +1473,22 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
     - 问题：MyProfile、Portfolio、ProposalDraft、OutcomeEvent、ClientRecord、Analytics、Selector 目前只有 schema key 或文档计划，没有完整业务闭环。
     - 修复：保持在后续版本实施；每个新业务域进入实现前，必须先写 CRUD contract 和真实 handler 测试清单。
 
+11. Import commit 的 replace / merge 语义不一致。
+    - 问题：Options 文案说 replace local data，但当前 `data:importCommit` 使用 `chrome.storage.local.set()` 写入导入 payload，缺失的 storage key 不会被删除。
+    - 修复建议：`[需确认]` 建议定义为 replace managed keys：commit 前删除 `Object.values(STORAGE_KEYS)` 中由本插件管理的 keys，再写入导入数据；API Key 从当前 settings 回填。若选择 merge，则必须修改 UI 文案和风险说明。
+
+12. 未来实体 import validation 不完整。
+    - 问题：`validateKnownTopLevelKeys()` 允许所有 `STORAGE_KEYS`，但 shape validation 只覆盖 opportunities、snapshots、profiles、scores、notes。导入非空 `uosc_proposal_drafts`、`uosc_outcome_events` 等未来实体时，当前不会校验字段结构。
+    - 修复：v0.2 暂时拒绝未实现实体的非空导入；到对应版本实现时再补完整 validator 和引用校验。
+
+13. 计划版本和扩展发布版本关系不明确。
+    - 问题：文档使用 v0.2/v0.3 作为计划版本，`manifest.json` 仍是 `0.1.0`。
+    - 修复：明确计划版本是否绑定 Chrome extension `manifest.version`。建议绑定：每完成一个可加载、可验证的计划版本后同步更新 manifest version。
+
+14. immutable revision / event 是否必须有 `updatedAt` 没有例外规则。
+    - 问题：第 2.0.2 写“每个模型至少包含 updatedAt”，但 `OpportunityNoteRevision` 当前只有 `createdAt`，append-only event/revision 通常不应更新。
+    - 修复：补充例外：immutable revision/event 可以没有 `updatedAt`，但必须有 `createdAt` / `recordedAt`；如果允许 void/correction，应通过新事件或 `voidedAt` 表达，不修改事实字段。
+
 #### 9.9.5 后续修复优先级
 
 1. P0：建立 background harness，并补 migration、capture、export/import commit、archive/delete 的真实 handler 测试。
@@ -1413,8 +1496,10 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
 3. P1：实现 `scoreStale`，补 notes revision 测试。
 4. P1：补 Settings 保存/读取/API Key 安全边界测试。
 5. P1：补 Chrome unpacked extension smoke，确认真实扩展上下文可加载。
-6. P2：补 Snapshot retention UI 和测试。
-7. P2：进入 v0.3 Profile review 前，补 `effectiveProfile`、conflict UI 和字段级 correction 测试。
+6. P1：确认并修复 import commit replace/merge 语义；补未来实体非空导入拒绝测试。
+7. P1：明确计划版本和 `manifest.version` 关系。
+8. P2：补 Snapshot retention UI 和测试。
+9. P2：进入 v0.3 Profile review 前，补 `effectiveProfile`、conflict UI 和字段级 correction 测试。
 
 ## 10. 字段唯一性契约：防止业务字段错位
 
@@ -1464,6 +1549,11 @@ MCP / Playwright 当前没有覆盖真实 background 业务逻辑，因为测试
    - 数值用明确单位，例如 `connectsSpent`、`hourlyRateMin`、`fixedBudgetAmount`。
    - 派生状态用 `*Summary` 或 `current*Id`，不能伪装成事实来源。
 6. 每个 derived/cache 字段必须标明事实来源字段和失效条件。
+
+当前代码状态：
+
+- `background` 已将 canonical `ScoreResult` 转成 legacy score view model 给 SidePanel 使用。
+- SidePanel 仍读取 `scoreResult.total_score`、`decision_summary`、`hard_red_flags` 等 snake_case 字段。该行为只能视为临时 compatibility view model；v0.3 前必须明确改为 camelCase detail view model，或把 legacy view model 明确标记为 UI compatibility 层并禁止写回 storage。
 
 ### 10.3 Canonical 字段注册表
 
@@ -2001,7 +2091,7 @@ AnalyticsSummary = {
 
 ### 10.4 固定枚举和版本常量
 
-v0.2 必须先把这些常量放进 `src/shared/schema.js`，实现和测试都引用同一份定义。
+v0.2 runtime 必须先把当前已实现业务所需常量放进 `src/shared/schema.js`，实现和测试都引用同一份定义。ProposalDraftStatus、OutcomeEvent.eventType 等 future enum 可以先保留在本文档，分别到 v0.5 / v0.6 实现时再进入 runtime schema。
 
 ```js
 SCHEMA_VERSION = 1
@@ -2066,12 +2156,12 @@ PromptVersions = {
 
 ### 10.6 v0.2 字段一致性验收
 
-v0.2 必须补上字段一致性测试，不允许只靠人工检查：
+v0.2 字段一致性验收必须区分已实现项和后续版本项，不允许只靠人工检查：
 
-1. 新增 `src/shared/schema.js`，导出 canonical field constants。
-2. 新增 legacy mapper 测试：v0.1 `total_score` 必须映射到 `totalScore`，`decision_summary` 必须映射到 `decisionSummary`。
-3. 新增 list/detail contract 测试：`listSummary` 不包含 `Snapshot.text`。
-4. 新增 score fixture 测试：OpenAI snake_case fake response 经 adapter 后只保存 camelCase canonical fields。
-5. Proposal fixture 测试不属于 v0.2；v0.5 引入 ProposalDraft adapter 时必须新增 `questions_to_ask -> questionsToAsk` 验收。
-6. 新增 notes stale 测试：notes revision 更新后，旧 ScoreResult 仍引用旧 `notesRevisionId`，当前 Opportunity 指向新 revision。
-7. 新增 import validation：发现未知可写字段、缺失 required canonical field、引用不存在 id 时拒绝导入。
+1. `[已实现]` 新增 `src/shared/schema.js`，导出 schema/storage/status/prompt constants。
+2. `[部分实现]` 新增 adapter 测试：OpenAI profile snake_case 会映射到 `OpportunityProfile.fields`；score fake response 会 clamp。仍需通过完整 `score:opportunity` handler 验证保存到 storage 的 canonical `totalScore`、`decisionSummary`。
+3. `[待实现测试]` 新增 list/detail contract 测试：`listSummary` 不包含 `Snapshot.text`。
+4. `[已实现 adapter 测试，待完整 handler 测试]` OpenAI snake_case fake response 经 adapter 后只保存 camelCase canonical fields。
+5. `[后续 v0.5]` Proposal fixture 测试不属于 v0.2；v0.5 引入 ProposalDraft adapter 时必须新增 `questions_to_ask -> questionsToAsk` 验收。
+6. `[待实现代码和测试]` 新增 notes stale 测试：notes revision 更新后，旧 ScoreResult 仍引用旧 `notesRevisionId`，当前 Opportunity 指向新 revision，并在 detail/UI 标记 `scoreStale`。
+7. `[部分实现]` import validation 已覆盖 core entity 未知字段、缺失 required field、引用不存在 id；仍需拒绝未来未实现实体的非空导入。
