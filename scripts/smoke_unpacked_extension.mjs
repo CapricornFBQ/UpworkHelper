@@ -191,6 +191,11 @@ async function smokeSidePanelPage(extensionId) {
     "#outcomeTimeline",
     "#profileFieldsPanel",
     "#profileConflictsPanel",
+    "#selectorFieldSelect",
+    "#selectorPageType",
+    "#pickSelectorButton",
+    "#extractSelectorsButton",
+    "#fieldSelectorsList",
     "#panelStatus"
   ]), true);
 
@@ -212,6 +217,9 @@ async function smokeSidePanelPage(extensionId) {
       document.querySelector("#outcomeBadge").textContent === "Applied" &&
       document.querySelector("#outcomeTimeline").textContent.includes("Proposal sent") &&
       document.querySelector("#outcomeSummaryPanel").textContent.includes("connects 6") &&
+      document.querySelector("#selectorBadge").textContent === "1 active" &&
+      document.querySelector("#fieldSelectorsList").textContent.includes("Budget") &&
+      document.querySelector("#fieldSelectorsList").textContent.includes("last failure: no_match") &&
       !document.querySelector("#saveNotesButton").disabled
     `);
   });
@@ -441,7 +449,29 @@ async function seedSmokeOpportunity(sessionId) {
         splitHistory: [],
         archivedAt: null
       }],
-      [STORAGE_KEYS.fieldSelectors]: [],
+      [STORAGE_KEYS.fieldSelectors]: [{
+        id: "selector_smoke_budget",
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: now,
+        updatedAt: now,
+        host: "www.upwork.com",
+        pageType: "job_detail",
+        fieldKey: "budgetText",
+        selector: ".smoke-budget",
+        sampleText: "$800",
+        version: 1,
+        lastUsedAt: null,
+        lastFailure: {
+          selectorId: "selector_smoke_budget",
+          fieldKey: "budgetText",
+          selector: ".smoke-budget",
+          pageType: "job_detail",
+          reason: "no_match",
+          sampleText: "$800",
+          failedAt: now
+        },
+        archivedAt: null
+      }],
       [STORAGE_KEYS.analyticsCache]: {}
     })})
   `);

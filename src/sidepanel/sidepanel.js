@@ -17,6 +17,12 @@ const clearProfileButton = document.querySelector("#clearProfileButton");
 const profileReviewBadge = document.querySelector("#profileReviewBadge");
 const profileFieldsPanel = document.querySelector("#profileFieldsPanel");
 const profileConflictsPanel = document.querySelector("#profileConflictsPanel");
+const selectorBadge = document.querySelector("#selectorBadge");
+const selectorFieldSelect = document.querySelector("#selectorFieldSelect");
+const selectorPageType = document.querySelector("#selectorPageType");
+const pickSelectorButton = document.querySelector("#pickSelectorButton");
+const extractSelectorsButton = document.querySelector("#extractSelectorsButton");
+const fieldSelectorsList = document.querySelector("#fieldSelectorsList");
 const summaryPanel = document.querySelector("#summaryPanel");
 const clientBadge = document.querySelector("#clientBadge");
 const clientSummaryPanel = document.querySelector("#clientSummaryPanel");
@@ -59,6 +65,7 @@ const outcomeTimeline = document.querySelector("#outcomeTimeline");
 
 let opportunities = [];
 let clientRecords = [];
+let fieldSelectors = [];
 let selectedId = null;
 let selectedOpportunity = null;
 let selectedOutcomeFilter = "";
@@ -91,6 +98,9 @@ function bindEvents() {
   extractProfileButton.addEventListener("click", extractProfile);
   saveProfileButton.addEventListener("click", saveProfileCorrections);
   clearProfileButton.addEventListener("click", clearProfileCorrections);
+  pickSelectorButton.addEventListener("click", pickFieldSelector);
+  extractSelectorsButton.addEventListener("click", extractCurrentSelectors);
+  fieldSelectorsList.addEventListener("click", archiveFieldSelectorFromList);
   generateProposalButton.addEventListener("click", generateProposal);
   saveProposalButton.addEventListener("click", saveProposalEdit);
   copyProposalButton.addEventListener("click", copyProposalText);
@@ -107,12 +117,14 @@ function bindEvents() {
 }
 
 async function refresh() {
-  const [opportunityResponse, clientResponse] = await Promise.all([
+  const [opportunityResponse, clientResponse, selectorResponse] = await Promise.all([
     send({ type: "opportunities:listSummary" }),
-    send({ type: "clients:list" })
+    send({ type: "clients:list" }),
+    send({ type: "selectors:list", filters: { includeArchived: false } })
   ]);
   opportunities = opportunityResponse.opportunities || [];
   clientRecords = clientResponse.clientRecords || [];
+  fieldSelectors = selectorResponse.fieldSelectors || [];
   const visible = getVisibleOpportunities();
   if (!selectedId || !visible.some((item) => item.id === selectedId)) {
     selectedId = visible[0]?.id || "";
@@ -527,6 +539,7 @@ function renderSelected() {
     notesInput.value = "";
     renderClient(null);
     renderProfileEditor(null);
+    renderSelectorAssist(null);
     renderProposal(null);
     renderOutcome(null);
     return;
@@ -536,10 +549,71 @@ function renderSelected() {
   renderSummary(opportunity);
   renderClient(opportunity);
   renderProfileEditor(opportunity);
+  renderSelectorAssist(opportunity);
   renderSnapshots(opportunity);
   renderDetails(opportunity);
   renderProposal(opportunity);
   renderOutcome(opportunity);
+}
+
+async function pickFieldSelector() {
+  if (!selectorFieldSelect.value) return;
+  setStatus("Pick an element on the active Upwork tab...");
+  setBusy(true);
+  try {
+    const response = await send({
+      type: "selectors:startPicking",
+      fieldKey: selectorFieldSelect.value,
+      pageType: selectorPageType.value || ""
+    });
+    fieldSelectors = [response.fieldSelector, ...fieldSelectors.filter((item) => item.id !== response.fieldSelector.id)];
+    setStatus("Selector saved");
+    renderSelectorAssist(getSelected());
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function extractCurrentSelectors() {
+  setStatus("Extracting selectors from active page...");
+  setBusy(true);
+  try {
+    const response = await send({ type: "selectors:extractForCurrentPage" });
+    const results = response.result?.selectorResults || [];
+    const failures = results.filter((item) => !item.ok);
+    const matches = results.filter((item) => item.ok);
+    await refreshSelectors();
+    setStatus(`Selector extract: ${matches.length} matched, ${failures.length} failed`);
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function archiveFieldSelectorFromList(event) {
+  const button = event.target.closest("[data-archive-selector-id]");
+  if (!button) return;
+  if (!confirm("Archive this field selector?")) return;
+  setStatus("Archiving selector...");
+  setBusy(true);
+  try {
+    await send({ type: "selectors:archive", id: button.dataset.archiveSelectorId });
+    await refreshSelectors();
+    setStatus("Selector archived");
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function refreshSelectors() {
+  const response = await send({ type: "selectors:list", filters: { includeArchived: false } });
+  fieldSelectors = response.fieldSelectors || [];
+  renderSelectorAssist(getSelected());
 }
 
 function renderSummary(opportunity) {
@@ -750,6 +824,47 @@ function renderProfileConflicts(conflicts) {
   }).join("");
 }
 
+function renderSelectorAssist(opportunity) {
+  selectorFieldSelect.innerHTML = PROFILE_FIELD_DEFINITIONS.map((definition) => (
+    `<option value="${escapeAttribute(definition.key)}">${escapeHtml(definition.label)}</option>`
+  )).join("");
+  const latestPageType = getLatestPageType(opportunity);
+  if ([...selectorPageType.options].some((option) => option.value === latestPageType)) {
+    selectorPageType.value = latestPageType;
+  }
+
+  const relevantSelectors = getRelevantFieldSelectors(opportunity);
+  pickSelectorButton.disabled = false;
+  extractSelectorsButton.disabled = !fieldSelectors.length;
+  selectorBadge.className = `badge${relevantSelectors.length ? " reviewed" : ""}`;
+  selectorBadge.textContent = `${relevantSelectors.length} active`;
+
+  if (!relevantSelectors.length) {
+    fieldSelectorsList.className = "list empty";
+    fieldSelectorsList.textContent = "No field selectors for this opportunity host/page type.";
+    return;
+  }
+
+  fieldSelectorsList.className = "list";
+  fieldSelectorsList.innerHTML = relevantSelectors.map((fieldSelector) => {
+    const definition = PROFILE_FIELD_DEFINITIONS.find((item) => item.key === fieldSelector.fieldKey);
+    const failure = fieldSelector.lastFailure;
+    return `
+      <div class="snapshot">
+        <strong>${escapeHtml(definition?.label || fieldSelector.fieldKey)}</strong>
+        <span>${escapeHtml(fieldSelector.pageType)} · v${escapeHtml(fieldSelector.version)}</span>
+        <small>${escapeHtml(fieldSelector.selector)}</small>
+        <small>sample: ${escapeHtml(fieldSelector.sampleText || "none")}</small>
+        ${fieldSelector.lastUsedAt ? `<small>last used ${escapeHtml(formatDateTime(fieldSelector.lastUsedAt))}</small>` : ""}
+        ${failure ? `<small class="warning">last failure: ${escapeHtml(failure.reason || "unknown")} on ${escapeHtml(failure.pageType || fieldSelector.pageType)}</small>` : ""}
+        <div class="button-row">
+          <button data-archive-selector-id="${escapeAttribute(fieldSelector.id)}" class="danger">Archive selector</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
 function renderSnapshots(opportunity) {
   snapshotsList.innerHTML = "";
   const snapshots = opportunity.snapshots || [];
@@ -767,9 +882,20 @@ function renderSnapshots(opportunity) {
       <span>${escapeHtml(new Date(snapshot.capturedAt).toLocaleString())}</span>
       <small>${escapeHtml(snapshot.pageTitle || snapshot.title)}</small>
       <small>${escapeHtml(snapshot.stats?.capturedCharCount || 0)} chars</small>
+      ${renderSelectorSnapshotStats(snapshot)}
     `;
     snapshotsList.append(item);
   }
+}
+
+function renderSelectorSnapshotStats(snapshot) {
+  const matches = snapshot.stats?.selectorMatches || [];
+  const failures = snapshot.stats?.selectorFailures || [];
+  if (!matches.length && !failures.length) return "";
+  return [
+    matches.length ? `<small>selector matches ${escapeHtml(matches.length)}</small>` : "",
+    ...failures.map((failure) => `<small class="warning">selector failed ${escapeHtml(failure.fieldKey)}: ${escapeHtml(failure.reason || "unknown")}</small>`)
+  ].filter(Boolean).join("");
 }
 
 function renderDetails(opportunity) {
@@ -1025,6 +1151,29 @@ function collectClientRecordInput({ forceNewKey = false } = {}) {
   };
 }
 
+function getRelevantFieldSelectors(opportunity) {
+  const host = getOpportunityHost(opportunity);
+  const pageType = getLatestPageType(opportunity);
+  return fieldSelectors.filter((fieldSelector) => {
+    if (fieldSelector.archivedAt) return false;
+    if (host && fieldSelector.host !== host) return false;
+    return fieldSelector.pageType === pageType;
+  });
+}
+
+function getOpportunityHost(opportunity) {
+  try {
+    return opportunity?.mainUrl ? new URL(opportunity.mainUrl).hostname : "";
+  } catch {
+    return "";
+  }
+}
+
+function getLatestPageType(opportunity) {
+  const snapshots = opportunity?.snapshots || [];
+  return snapshots[snapshots.length - 1]?.pageType || "job_detail";
+}
+
 function getVisibleOpportunities() {
   if (!selectedOutcomeFilter) return opportunities;
   return opportunities.filter((item) => (item.outcomeSummary?.status || OUTCOME_STATUS.notApplied) === selectedOutcomeFilter);
@@ -1069,6 +1218,10 @@ function setBusy(isBusy) {
   extractProfileButton.disabled = isBusy || !selectedId;
   saveProfileButton.disabled = isBusy || !selectedOpportunity?.profile;
   clearProfileButton.disabled = isBusy || !selectedOpportunity?.profile?.reviewedAt;
+  selectorFieldSelect.disabled = isBusy;
+  selectorPageType.disabled = isBusy;
+  pickSelectorButton.disabled = isBusy;
+  extractSelectorsButton.disabled = isBusy || !fieldSelectors.length;
   generateProposalButton.disabled = isBusy || !selectedId || !selectedOpportunity?.currentScoreResultId || selectedOpportunity?.scoreStale;
   saveProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft;
   copyProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft?.finalText;

@@ -115,6 +115,33 @@
       </section>
 
       <section class="panel">
+        <div class="section-header">
+          <h2>Selector Assist</h2>
+          <span id="selectorBadge" class="badge">No selectors</span>
+        </div>
+        <div class="grid-2">
+          <label for="selectorFieldSelect">
+            Field
+            <select id="selectorFieldSelect"></select>
+          </label>
+          <label for="selectorPageType">
+            Page type
+            <select id="selectorPageType">
+              <option value="job_detail">Job detail</option>
+              <option value="search_result">Search result</option>
+              <option value="client_profile">Client profile</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+        </div>
+        <div class="button-row">
+          <button id="pickSelectorButton">Pick selector</button>
+          <button id="extractSelectorsButton">Extract selectors</button>
+        </div>
+        <div id="fieldSelectorsList" class="list empty">No field selectors.</div>
+      </section>
+
+      <section class="panel">
         <h2>Snapshots</h2>
         <div id="snapshotsList" class="list empty">No snapshots.</div>
       </section>

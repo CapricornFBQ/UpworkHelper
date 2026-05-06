@@ -44,7 +44,7 @@ for (const file of jsFiles) {
 assert.equal(SCHEMA_VERSION, 1);
 assert.equal(DEFAULT_SETTINGS.captureMode, "strict_upwork");
 assert.equal(PLATFORM_HOSTS.upwork, "www.upwork.com");
-assert.equal(PLAN_VERSION, "0.8.0");
+assert.equal(PLAN_VERSION, "0.9.0");
 assert.equal(OPPORTUNITY_STATUS.draft, "draft");
 assert.equal(OPPORTUNITY_STATUS.captured, "captured");
 assert.equal(OUTCOME_STATUS.applied, "applied");
@@ -239,7 +239,7 @@ assert.equal(missingReferencePreview.ok, false);
 assert.match(missingReferencePreview.error, /references missing opportunity/);
 
 const unsupportedFutureEntity = structuredClone(validImportPayload);
-unsupportedFutureEntity.data[STORAGE_KEYS.fieldSelectors] = [{ id: "selector_1" }];
+unsupportedFutureEntity.data[STORAGE_KEYS.analyticsCache] = { stale: true };
 const unsupportedFutureEntityPreview = await sendBackgroundMessage({ type: "data:importPreview", data: unsupportedFutureEntity });
 assert.equal(unsupportedFutureEntityPreview.ok, false);
 assert.match(unsupportedFutureEntityPreview.error, /import is not supported yet/);
@@ -288,10 +288,11 @@ await runPersonalContextScoreTests();
 await runProposalDraftTests();
 await runOutcomeEventTests();
 await runClientRecordTests();
+await runSelectorAssistTests();
 await runAnalyticsTests();
 await runScoreTests();
 
-console.log("v0.8 validation passed");
+console.log("v0.9 validation passed");
 
 async function runSettingsExportBackupTests() {
   const harness = await loadBackgroundForValidation({
@@ -1252,6 +1253,192 @@ async function runClientRecordTests() {
   assert.match(duplicateClientPreview.error, /duplicates active primaryClientKey/);
 }
 
+async function runSelectorAssistTests() {
+  const harness = await loadBackgroundForValidation();
+
+  const created = await harness({
+    type: "selectors:create",
+    fieldSelector: {
+      host: "www.upwork.com",
+      pageType: "job_detail",
+      fieldKey: "budgetText",
+      selector: ".budget",
+      sampleText: "$500"
+    }
+  });
+  assert.equal(created.ok, true);
+  assert.equal(created.fieldSelector.version, 1);
+  assert.equal(created.fieldSelector.fieldKey, "budgetText");
+  const selectorId = created.fieldSelector.id;
+
+  const listed = await harness({ type: "selectors:list", filters: { host: "www.upwork.com", pageType: "job_detail" } });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.fieldSelectors.length, 1);
+
+  const updated = await harness({
+    type: "selectors:update",
+    id: selectorId,
+    fieldSelector: { selector: ".budget strong", sampleText: "$1200" }
+  });
+  assert.equal(updated.ok, true);
+  assert.equal(updated.fieldSelector.version, 2);
+  assert.equal(updated.fieldSelector.selector, ".budget strong");
+
+  const invalidFieldKey = await harness({
+    type: "selectors:create",
+    fieldSelector: {
+      host: "www.upwork.com",
+      pageType: "job_detail",
+      fieldKey: "notAField",
+      selector: ".bad",
+      sampleText: "bad"
+    }
+  });
+  assert.equal(invalidFieldKey.ok, false);
+  assert.match(invalidFieldKey.error, /Unsupported profile field key/);
+
+  const archived = await harness({ type: "selectors:archive", id: selectorId });
+  assert.equal(archived.ok, true);
+  const activeAfterArchive = await harness({ type: "selectors:list", filters: { host: "www.upwork.com", pageType: "job_detail" } });
+  assert.equal(activeAfterArchive.fieldSelectors.length, 0);
+  const allAfterArchive = await harness({ type: "selectors:list", filters: { includeArchived: true } });
+  assert.equal(allAfterArchive.fieldSelectors.length, 1);
+
+  const pickHarness = await loadBackgroundForValidation({
+    activeTab: { id: 1, url: "https://www.upwork.com/jobs/details/pick-selector", title: "Pick selector" },
+    scriptResult: {
+      selector: ".up-budget",
+      sampleText: "$900",
+      url: "https://www.upwork.com/jobs/details/pick-selector",
+      pageText: "Upwork job Budget $900"
+    }
+  });
+  const picked = await pickHarness({ type: "selectors:startPicking", fieldKey: "budgetText", pageType: "job_detail" });
+  assert.equal(picked.ok, true);
+  assert.equal(picked.fieldSelector.host, "www.upwork.com");
+  assert.equal(picked.fieldSelector.selector, ".up-budget");
+
+  const selectorCaptureHarness = await loadBackgroundForValidation({
+    storageData: {
+      [STORAGE_KEYS.fieldSelectors]: [makeFieldSelector("selector_capture", {
+        fieldKey: "budgetText",
+        selector: ".budget",
+        sampleText: "$500"
+      })]
+    }
+  });
+  selectorCaptureHarness.setActiveTab({ id: 1, url: "https://www.upwork.com/jobs/details/selector-capture", title: "Selector capture" });
+  selectorCaptureHarness.setCaptureResult(makeCaptureResult(
+    "https://www.upwork.com/jobs/details/selector-capture",
+    "Selector capture",
+    "Build an extension. Budget $1200.",
+    {
+      selectorResults: [{
+        selectorId: "selector_capture",
+        fieldKey: "budgetText",
+        selector: ".budget",
+        ok: true,
+        text: "$1200"
+      }]
+    }
+  ));
+  const captured = await selectorCaptureHarness({ type: "capture:currentPage" });
+  assert.equal(captured.ok, true);
+  assert.equal(captured.snapshot.stats.selectorMatches.length, 1);
+  assert.equal(selectorCaptureHarness.storageData[STORAGE_KEYS.fieldSelectors][0].lastUsedAt !== null, true);
+  assert.equal(selectorCaptureHarness.storageData[STORAGE_KEYS.fieldSelectors][0].lastFailure, null);
+
+  const selectorFailureHarness = await loadBackgroundForValidation({
+    storageData: {
+      [STORAGE_KEYS.fieldSelectors]: [makeFieldSelector("selector_failure", {
+        fieldKey: "proposalCountText",
+        selector: ".proposal-count",
+        sampleText: "5 to 10"
+      })]
+    }
+  });
+  selectorFailureHarness.setCaptureResult(makeCaptureResult(
+    "https://www.upwork.com/jobs/details/default-job",
+    "Selector failure",
+    "Build an extension",
+    {
+      selectorResults: [{
+        selectorId: "selector_failure",
+        fieldKey: "proposalCountText",
+        selector: ".proposal-count",
+        ok: false,
+        reason: "no_match"
+      }]
+    }
+  ));
+  const failedCapture = await selectorFailureHarness({ type: "capture:currentPage" });
+  assert.equal(failedCapture.ok, true);
+  assert.equal(failedCapture.snapshot.stats.selectorFailures[0].reason, "no_match");
+  assert.equal(selectorFailureHarness.storageData[STORAGE_KEYS.fieldSelectors][0].lastFailure.reason, "no_match");
+
+  const extractHarness = await loadBackgroundForValidation({
+    storageData: {
+      [STORAGE_KEYS.fieldSelectors]: [makeFieldSelector("selector_extract", {
+        fieldKey: "connectsCostText",
+        selector: ".connects",
+        sampleText: "8 connects"
+      })]
+    },
+    scriptResult: {
+      url: "https://www.upwork.com/jobs/details/default-job",
+      pageText: "Job detail connects",
+      selectorResults: [{
+        selectorId: "selector_extract",
+        fieldKey: "connectsCostText",
+        selector: ".connects",
+        ok: false,
+        reason: "no_match"
+      }]
+    }
+  });
+  const extractedSelectors = await extractHarness({ type: "selectors:extractForCurrentPage" });
+  assert.equal(extractedSelectors.ok, true, extractedSelectors.error);
+  assert.equal(extractedSelectors.result.selectorFailures[0].reason, "no_match");
+  assert.equal(extractHarness.storageData[STORAGE_KEYS.fieldSelectors][0].lastFailure.reason, "no_match");
+
+  const profileHarness = await loadBackgroundForValidation({
+    storageData: {
+      ...makeScoreStorageData("opp_selector_profile"),
+      [STORAGE_KEYS.snapshots]: [makeSnapshot("snap_opp_selector_profile", "opp_selector_profile", {
+        stats: {
+          charCount: 25,
+          capturedCharCount: 25,
+          selectorMatches: [{
+            selectorId: "selector_profile",
+            fieldKey: "budgetText",
+            selector: ".budget",
+            text: "$1500",
+            sampleText: "$500"
+          }]
+        }
+      })]
+    },
+    fetchResponses: [openAIText({ ...fakeProfile, budget: "$500" })]
+  });
+  const profileExtract = await profileHarness({ type: "profile:extract", opportunityId: "opp_selector_profile" });
+  assert.equal(profileExtract.ok, true);
+  assert.equal(profileExtract.opportunity.profile.fields.budgetText.value, "$1500");
+  assert.equal(profileExtract.opportunity.profile.fields.budgetText.effectiveSource, "selector");
+  assert.equal(profileExtract.opportunity.profile.fields.budgetText.sources.some((source) => source.selectorId === "selector_profile"), true);
+
+  const selectorImport = structuredClone(validImportPayload);
+  selectorImport.data[STORAGE_KEYS.fieldSelectors] = [makeFieldSelector("selector_import")];
+  const selectorImportPreview = await harness({ type: "data:importPreview", data: selectorImport });
+  assert.equal(selectorImportPreview.ok, true);
+  assert.equal(selectorImportPreview.preview.entityCounts.fieldSelectors, 1);
+
+  const badSelectorImport = structuredClone(selectorImport);
+  badSelectorImport.data[STORAGE_KEYS.fieldSelectors][0].fieldKey = "badField";
+  const badSelectorPreview = await harness({ type: "data:importPreview", data: badSelectorImport });
+  assert.equal(badSelectorPreview.ok, false);
+  assert.match(badSelectorPreview.error, /unsupported fieldKey/);
+}
+
 async function runAnalyticsTests() {
   const harness = await loadBackgroundForValidation({
     storageData: {
@@ -1471,6 +1658,7 @@ async function loadBackgroundForValidation(options = {}) {
   };
   let activeTab = options.activeTab || { id: 1, url: "https://www.upwork.com/jobs/details/default-job", title: "Default job - Upwork" };
   let captureResult = options.captureResult || makeCaptureResult(activeTab.url, activeTab.title, "Default readable Upwork text");
+  let scriptResult = options.scriptResult || null;
   const fetchQueue = [...(options.fetchResponses || [])];
   const fetchCalls = [];
 
@@ -1524,8 +1712,10 @@ async function loadBackgroundForValidation(options = {}) {
       }
     },
     scripting: {
-      async executeScript() {
-        const result = typeof captureResult === "function" ? await captureResult() : captureResult;
+      async executeScript(details = {}) {
+        const injectionName = details.func?.name || "";
+        const source = injectionName === "captureVisibleDom" ? captureResult : (scriptResult || captureResult);
+        const result = typeof source === "function" ? await source(details) : source;
         return [{ result }];
       }
     },
@@ -1547,6 +1737,9 @@ async function loadBackgroundForValidation(options = {}) {
   };
   sendMessage.setCaptureResult = (result) => {
     captureResult = result;
+  };
+  sendMessage.setScriptResult = (result) => {
+    scriptResult = result;
   };
   sendMessage.pushFetchResponse = (response) => {
     fetchQueue.push(response);
@@ -1841,7 +2034,27 @@ function makeClientRecord(id = "client_record", overrides = {}) {
   };
 }
 
-function makeCaptureResult(url, title, text) {
+function makeFieldSelector(id = "selector_extension", overrides = {}) {
+  const now = "2026-05-06T00:00:00.000Z";
+  return {
+    id,
+    schemaVersion: SCHEMA_VERSION,
+    createdAt: now,
+    updatedAt: now,
+    host: "www.upwork.com",
+    pageType: "job_detail",
+    fieldKey: "budgetText",
+    selector: ".budget",
+    sampleText: "$500",
+    version: 1,
+    lastUsedAt: null,
+    lastFailure: null,
+    archivedAt: null,
+    ...overrides
+  };
+}
+
+function makeCaptureResult(url, title, text, overrides = {}) {
   return {
     title,
     url,
@@ -1850,7 +2063,8 @@ function makeCaptureResult(url, title, text) {
     stats: {
       charCount: text.length,
       capturedCharCount: text.length
-    }
+    },
+    ...overrides
   };
 }
 

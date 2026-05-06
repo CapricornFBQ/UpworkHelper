@@ -36,9 +36,9 @@ const OUTCOME_EVENT_SOURCES = Object.freeze(["manual", "capture", "import"]);
 const CLIENT_IDENTITY_SOURCE_TYPES = Object.freeze(["manual", "exact", "import", "merge", "split"]);
 const ANALYTICS_WINDOWS = Object.freeze(["last_30_days", "last_90_days", "all_time"]);
 const ANALYTICS_LOW_SAMPLE_APPLIED_COUNT = 20;
+const PROFILE_FIELD_KEYS = Object.freeze(PROFILE_FIELD_DEFINITIONS.map((definition) => definition.key));
 const MANAGED_STORAGE_KEYS = Object.freeze(Object.values(STORAGE_KEYS));
 const UNIMPLEMENTED_IMPORT_KEYS = Object.freeze([
-  STORAGE_KEYS.fieldSelectors,
   STORAGE_KEYS.analyticsCache
 ]);
 
@@ -187,6 +187,19 @@ async function handleMessage(message) {
       return { ok: true, groups: await getAnalyticsGroups("clientType", message.filters || message) };
     case "analytics:getByTemplate":
       return { ok: true, groups: await getAnalyticsGroups("template", message.filters || message) };
+    case "selectors:list":
+      return { ok: true, fieldSelectors: await listFieldSelectors(message.filters || message) };
+    case "selectors:create":
+      return { ok: true, fieldSelector: await createFieldSelector(message.fieldSelector || message.selector || {}) };
+    case "selectors:update":
+      return { ok: true, fieldSelector: await updateFieldSelector(message.id, message.fieldSelector || message.selector || {}) };
+    case "selectors:delete":
+    case "selectors:archive":
+      return { ok: true, fieldSelector: await archiveFieldSelector(message.id) };
+    case "selectors:startPicking":
+      return { ok: true, fieldSelector: await startSelectorPicking(message.fieldKey, message.pageType || "") };
+    case "selectors:extractForCurrentPage":
+      return { ok: true, result: await extractSelectorsForCurrentPage() };
     default:
       throw new Error(`Unknown message type: ${message?.type || "empty"}`);
   }
@@ -918,7 +931,8 @@ async function extractProfileForOpportunity(opportunityId) {
       model: settings.extractModel,
       inputSnapshotIds: extractionInput.snapshotIds,
       version: profileVersion,
-      createdAt
+      createdAt,
+      selectorMatches: collectSelectorMatches(extractionInput.detail.snapshots)
     });
     store.opportunityProfiles.push(profileRecord);
     store.opportunities[index] = {
@@ -1099,6 +1113,18 @@ function getProfileTitle(profile) {
   return Array.isArray(value) ? value.join(", ") : String(value || "").trim();
 }
 
+async function getActiveSelectorsForHost(host) {
+  const data = await chrome.storage.local.get(STORAGE_KEYS.fieldSelectors);
+  return (data[STORAGE_KEYS.fieldSelectors] || [])
+    .filter((item) => !item.archivedAt && item.host === host)
+    .map((item) => ({
+      id: item.id,
+      fieldKey: item.fieldKey,
+      selector: item.selector,
+      pageType: item.pageType
+    }));
+}
+
 async function captureCurrentPage(opportunityId) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) throw new Error("No active tab found");
@@ -1107,15 +1133,16 @@ async function captureCurrentPage(opportunityId) {
     throw new Error("Capture is limited to https://www.upwork.com pages");
   }
 
+  const hostSelectors = await getActiveSelectorsForHost(tabUrl.hostname);
   const [{ result }] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: captureVisibleDom,
-    args: [MAX_SNAPSHOT_CHARS]
+    args: [MAX_SNAPSHOT_CHARS, hostSelectors]
   });
 
   if (!result?.text) throw new Error("No readable page text found");
-  const sourceUrl = result.url || tab.url;
-  const sourceParsed = parseUrl(sourceUrl);
+    const sourceUrl = result.url || tab.url;
+    const sourceParsed = parseUrl(sourceUrl);
   if (!sourceParsed || sourceParsed.protocol !== "https:" || sourceParsed.hostname !== PLATFORM_HOSTS.upwork) {
     throw new Error("Capture is limited to https://www.upwork.com pages");
   }
@@ -1125,6 +1152,13 @@ async function captureCurrentPage(opportunityId) {
     const jobKey = extractUpworkJobKey(sourceUrl);
     const store = await readStore();
     let opportunity = opportunityId ? store.opportunities.find((item) => item.id === opportunityId) : null;
+    const pageType = inferPageType(sourceUrl, result.text);
+    const selectorCapture = applySelectorCaptureResult(store, {
+      host: sourceParsed.hostname,
+      pageType,
+      selectorResults: result.selectorResults || [],
+      capturedAt
+    });
 
     if (opportunity && opportunity.status === OPPORTUNITY_STATUS.archived) {
       throw new Error("Archived opportunities cannot receive new snapshots");
@@ -1144,12 +1178,16 @@ async function captureCurrentPage(opportunityId) {
       capturedAt,
       sourceUrl,
       pageTitle: result.title || tab.title || "Untitled",
-      pageType: inferPageType(sourceUrl, result.text),
+      pageType,
       platform: "upwork",
       text: result.text,
       textHash: await hashText(result.text),
       domSummary: result.domSummary || [],
-      stats: result.stats || {},
+      stats: {
+        ...(result.stats || {}),
+        selectorMatches: selectorCapture.matches,
+        selectorFailures: selectorCapture.failures
+      },
       retentionState: SNAPSHOT_RETENTION_STATE.full
     };
 
@@ -1192,7 +1230,7 @@ async function captureCurrentPage(opportunityId) {
   });
 }
 
-function captureVisibleDom(maxChars) {
+function captureVisibleDom(maxChars, fieldSelectors = []) {
   const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "SVG", "PATH", "IMG", "VIDEO", "CANVAS", "IFRAME"]);
   const domSummary = [];
   let visitedNodes = 0;
@@ -1217,6 +1255,59 @@ function captureVisibleDom(maxChars) {
 
   const root = document.body || document.documentElement;
   const text = cleanText(root.innerText || root.textContent || "");
+  const selectorResults = [];
+  for (const selector of Array.isArray(fieldSelectors) ? fieldSelectors : []) {
+    try {
+      const node = document.querySelector(selector.selector);
+      if (!node) {
+        selectorResults.push({
+          selectorId: selector.id,
+          fieldKey: selector.fieldKey,
+          selector: selector.selector,
+          ok: false,
+          reason: "no_match"
+        });
+        continue;
+      }
+      if (!isVisible(node)) {
+        selectorResults.push({
+          selectorId: selector.id,
+          fieldKey: selector.fieldKey,
+          selector: selector.selector,
+          ok: false,
+          reason: "not_visible"
+        });
+        continue;
+      }
+      const value = cleanText(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+      if (!value) {
+        selectorResults.push({
+          selectorId: selector.id,
+          fieldKey: selector.fieldKey,
+          selector: selector.selector,
+          ok: false,
+          reason: "empty_text"
+        });
+        continue;
+      }
+      selectorResults.push({
+        selectorId: selector.id,
+        fieldKey: selector.fieldKey,
+        selector: selector.selector,
+        ok: true,
+        text: value.slice(0, 1000)
+      });
+    } catch (error) {
+      selectorResults.push({
+        selectorId: selector.id,
+        fieldKey: selector.fieldKey,
+        selector: selector.selector,
+        ok: false,
+        reason: "selector_error",
+        error: String(error?.message || error)
+      });
+    }
+  }
   const summaryNodes = root.querySelectorAll("h1,h2,h3,h4,button,a,[data-test],[data-qa],[aria-label]");
   for (const node of summaryNodes) {
     visitedNodes += 1;
@@ -1241,6 +1332,7 @@ function captureVisibleDom(maxChars) {
     title: document.title,
     url: location.href,
     text: text.slice(0, maxChars),
+    selectorResults,
     domSummary,
     stats: {
       charCount: text.length,
@@ -1278,6 +1370,54 @@ function createCaptureOutcomeEvent({ opportunity, snapshot, text, capturedAt }) 
     correctionOfEventId: null,
     voidedAt: null
   };
+}
+
+function applySelectorCaptureResult(store, { host, pageType, selectorResults, capturedAt }) {
+  const matches = [];
+  const failures = [];
+  const resultBySelectorId = new Map((selectorResults || []).map((result) => [result.selectorId, result]));
+  for (const fieldSelector of store.fieldSelectors || []) {
+    if (fieldSelector.archivedAt || fieldSelector.host !== host || fieldSelector.pageType !== pageType) continue;
+    const result = resultBySelectorId.get(fieldSelector.id);
+    if (!result) continue;
+    if (result.ok) {
+      const match = {
+        selectorId: fieldSelector.id,
+        fieldKey: fieldSelector.fieldKey,
+        selector: fieldSelector.selector,
+        text: normalizeText(result.text),
+        sampleText: fieldSelector.sampleText,
+        capturedAt
+      };
+      matches.push(match);
+      fieldSelector.lastUsedAt = capturedAt;
+      fieldSelector.lastFailure = null;
+      fieldSelector.updatedAt = capturedAt;
+    } else {
+      const failure = {
+        selectorId: fieldSelector.id,
+        fieldKey: fieldSelector.fieldKey,
+        selector: fieldSelector.selector,
+        reason: normalizeText(result.reason || result.error || "unknown_failure"),
+        sampleText: fieldSelector.sampleText,
+        pageType,
+        capturedAt
+      };
+      failures.push(failure);
+      fieldSelector.lastFailure = failure;
+      fieldSelector.updatedAt = capturedAt;
+    }
+  }
+  return { matches, failures };
+}
+
+function collectSelectorMatches(snapshots = []) {
+  return snapshots
+    .flatMap((snapshot) => (snapshot.stats?.selectorMatches || []).map((match) => ({
+      ...match,
+      snapshotId: snapshot.id
+    })))
+    .filter((match) => match.fieldKey && match.text);
 }
 
 function detectOutcomeStatusFromCapture(url, text) {
@@ -1367,7 +1507,8 @@ async function scoreOpportunity(opportunityId) {
       model: settings.extractModel,
       inputSnapshotIds: scoringInput.snapshotIds,
       version: scoringInput.profileCount + 1,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      selectorMatches: collectSelectorMatches(scoringInput.detail.snapshots)
     });
     shouldCreateProfile = true;
   }
@@ -2273,6 +2414,276 @@ function average(values) {
   return Math.round((finite.reduce((sum, value) => sum + value, 0) / finite.length) * 10) / 10;
 }
 
+async function listFieldSelectors(filters = {}) {
+  const store = await readStore();
+  const normalized = normalizeSelectorFilters(filters);
+  return (store.fieldSelectors || [])
+    .filter((item) => normalized.includeArchived || !item.archivedAt)
+    .filter((item) => !normalized.host || item.host === normalized.host)
+    .filter((item) => !normalized.pageType || item.pageType === normalized.pageType)
+    .filter((item) => !normalized.fieldKey || item.fieldKey === normalized.fieldKey)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
+}
+
+async function createFieldSelector(input = {}) {
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const fieldSelector = normalizeFieldSelectorInput(input, { now: new Date().toISOString() });
+    store.fieldSelectors.push(fieldSelector);
+    await writeStore(store);
+    return fieldSelector;
+  });
+}
+
+async function updateFieldSelector(id, input = {}) {
+  if (!id) throw new Error("FieldSelector id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.fieldSelectors.findIndex((item) => item.id === id);
+    if (index === -1) throw new Error("FieldSelector not found");
+    if (store.fieldSelectors[index].archivedAt) throw new Error("Archived FieldSelector cannot be updated");
+    const updated = normalizeFieldSelectorInput(input, {
+      current: store.fieldSelectors[index],
+      now: new Date().toISOString()
+    });
+    store.fieldSelectors[index] = updated;
+    await writeStore(store);
+    return updated;
+  });
+}
+
+async function archiveFieldSelector(id) {
+  if (!id) throw new Error("FieldSelector id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.fieldSelectors.findIndex((item) => item.id === id);
+    if (index === -1) throw new Error("FieldSelector not found");
+    const now = new Date().toISOString();
+    store.fieldSelectors[index] = {
+      ...store.fieldSelectors[index],
+      updatedAt: now,
+      archivedAt: store.fieldSelectors[index].archivedAt || now
+    };
+    await writeStore(store);
+    return store.fieldSelectors[index];
+  });
+}
+
+async function startSelectorPicking(fieldKey, pageType = "") {
+  ensureValidProfileFieldKey(fieldKey);
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) throw new Error("No active tab found");
+  const tabUrl = parseUrl(tab.url);
+  if (!tabUrl || tabUrl.protocol !== "https:" || tabUrl.hostname !== PLATFORM_HOSTS.upwork) {
+    throw new Error("Selector picking is limited to https://www.upwork.com pages");
+  }
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pickSelectorOnPage,
+    args: [fieldKey]
+  });
+  if (!result?.selector || !result?.sampleText) throw new Error(result?.error || "Selector picking canceled");
+  return createFieldSelector({
+    host: tabUrl.hostname,
+    pageType: normalizeText(pageType) || inferPageType(result.url || tab.url, result.pageText || result.sampleText || ""),
+    fieldKey,
+    selector: result.selector,
+    sampleText: result.sampleText
+  });
+}
+
+async function extractSelectorsForCurrentPage() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) throw new Error("No active tab found");
+  const tabUrl = parseUrl(tab.url);
+  if (!tabUrl || tabUrl.protocol !== "https:" || tabUrl.hostname !== PLATFORM_HOSTS.upwork) {
+    throw new Error("Selector extraction is limited to https://www.upwork.com pages");
+  }
+  const selectors = await getActiveSelectorsForHost(tabUrl.hostname);
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: extractSelectorValuesOnPage,
+    args: [selectors]
+  });
+  let selectorCapture = { matches: [], failures: [] };
+  await withStorageLock(async () => {
+    const store = await readStore();
+    selectorCapture = applySelectorCaptureResult(store, {
+      host: tabUrl.hostname,
+      pageType: inferPageType(result?.url || tab.url, result?.pageText || ""),
+      selectorResults: result?.selectorResults || [],
+      capturedAt: new Date().toISOString()
+    });
+    await writeStore(store);
+  });
+  return {
+    host: tabUrl.hostname,
+    url: result?.url || tab.url,
+    selectorResults: result?.selectorResults || [],
+    selectorMatches: selectorCapture.matches,
+    selectorFailures: selectorCapture.failures
+  };
+}
+
+function normalizeSelectorFilters(input = {}) {
+  return {
+    includeArchived: Boolean(input.includeArchived),
+    host: normalizeText(input.host),
+    pageType: normalizeText(input.pageType || input.page_type),
+    fieldKey: normalizeText(input.fieldKey || input.field_key)
+  };
+}
+
+function normalizeFieldSelectorInput(input = {}, { current = null, now }) {
+  const fieldKey = normalizeText(input.fieldKey || input.field_key || current?.fieldKey);
+  ensureValidProfileFieldKey(fieldKey);
+  const host = normalizeText(input.host || current?.host);
+  if (!host) throw new Error("FieldSelector host is required");
+  const selector = normalizeText(input.selector || current?.selector);
+  if (!selector) throw new Error("FieldSelector selector is required");
+  return {
+    id: current?.id || normalizeText(input.id) || crypto.randomUUID(),
+    schemaVersion: SCHEMA_VERSION,
+    createdAt: current?.createdAt || normalizeOptionalIsoTime(input.createdAt || input.created_at) || now,
+    updatedAt: now,
+    host,
+    pageType: normalizeText(input.pageType || input.page_type || current?.pageType || "unknown"),
+    fieldKey,
+    selector,
+    sampleText: normalizeText(input.sampleText || input.sample_text || current?.sampleText),
+    version: Number(current?.version || 0) + 1,
+    lastUsedAt: current?.lastUsedAt || null,
+    lastFailure: current?.lastFailure || null,
+    archivedAt: current?.archivedAt || null
+  };
+}
+
+function ensureValidProfileFieldKey(fieldKey) {
+  if (!PROFILE_FIELD_KEYS.includes(fieldKey)) throw new Error(`Unsupported profile field key: ${fieldKey || "(missing)"}`);
+}
+
+function pickSelectorOnPage(fieldKey) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = [
+      "position:fixed",
+      "z-index:2147483647",
+      "pointer-events:none",
+      "border:2px solid #167a57",
+      "background:rgba(22,122,87,0.08)",
+      "display:none"
+    ].join(";");
+    const label = document.createElement("div");
+    label.textContent = `Pick ${fieldKey}. Press Esc to cancel.`;
+    label.style.cssText = [
+      "position:fixed",
+      "z-index:2147483647",
+      "left:12px",
+      "top:12px",
+      "padding:8px 10px",
+      "border-radius:6px",
+      "background:#167a57",
+      "color:#fff",
+      "font:13px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+    ].join(";");
+    document.documentElement.append(overlay, label);
+
+    function cleanText(value) {
+      return String(value || "").replace(/\s+/g, " ").trim();
+    }
+    function cleanup() {
+      document.removeEventListener("pointerover", onPointerOver, true);
+      document.removeEventListener("click", onClick, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      overlay.remove();
+      label.remove();
+    }
+    function selectorFor(element) {
+      if (element.id) return `#${CSS.escape(element.id)}`;
+      const dataAttr = ["data-test", "data-qa", "data-testid"].find((name) => element.getAttribute(name));
+      if (dataAttr) return `${element.tagName.toLowerCase()}[${dataAttr}="${CSS.escape(element.getAttribute(dataAttr))}"]`;
+      const parts = [];
+      let node = element;
+      while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.body && parts.length < 5) {
+        let part = node.tagName.toLowerCase();
+        if (node.classList.length) part += `.${CSS.escape([...node.classList][0])}`;
+        const parent = node.parentElement;
+        if (parent) {
+          const sameTag = [...parent.children].filter((child) => child.tagName === node.tagName);
+          if (sameTag.length > 1) part += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
+        }
+        parts.unshift(part);
+        node = parent;
+      }
+      return parts.join(" > ");
+    }
+    function onPointerOver(event) {
+      const target = event.target;
+      if (!target || target === overlay || target === label || !target.getBoundingClientRect) return;
+      const rect = target.getBoundingClientRect();
+      overlay.style.display = "block";
+      overlay.style.left = `${rect.left}px`;
+      overlay.style.top = `${rect.top}px`;
+      overlay.style.width = `${rect.width}px`;
+      overlay.style.height = `${rect.height}px`;
+    }
+    function onClick(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      const target = event.target;
+      cleanup();
+      resolve({
+        selector: selectorFor(target),
+        sampleText: cleanText(target.innerText || target.textContent || target.getAttribute("aria-label") || "").slice(0, 1000),
+        url: location.href,
+        pageText: cleanText(document.body?.innerText || "")
+      });
+    }
+    function onKeyDown(event) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      cleanup();
+      resolve({ error: "Selector picking canceled" });
+    }
+    document.addEventListener("pointerover", onPointerOver, true);
+    document.addEventListener("click", onClick, true);
+    document.addEventListener("keydown", onKeyDown, true);
+  });
+}
+
+function extractSelectorValuesOnPage(fieldSelectors = []) {
+  function cleanText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+  const pageText = cleanText(document.body?.innerText || "");
+  function isVisible(element) {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return true;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 && (rect.width !== 0 || rect.height !== 0 || element.getClientRects().length !== 0);
+  }
+  const selectorResults = [];
+  for (const selector of Array.isArray(fieldSelectors) ? fieldSelectors : []) {
+    try {
+      const node = document.querySelector(selector.selector);
+      if (!node) {
+        selectorResults.push({ selectorId: selector.id, fieldKey: selector.fieldKey, selector: selector.selector, ok: false, reason: "no_match" });
+      } else if (!isVisible(node)) {
+        selectorResults.push({ selectorId: selector.id, fieldKey: selector.fieldKey, selector: selector.selector, ok: false, reason: "not_visible" });
+      } else {
+        const text = cleanText(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+        selectorResults.push(text
+          ? { selectorId: selector.id, fieldKey: selector.fieldKey, selector: selector.selector, ok: true, text: text.slice(0, 1000) }
+          : { selectorId: selector.id, fieldKey: selector.fieldKey, selector: selector.selector, ok: false, reason: "empty_text" });
+      }
+    } catch (error) {
+      selectorResults.push({ selectorId: selector.id, fieldKey: selector.fieldKey, selector: selector.selector, ok: false, reason: "selector_error", error: String(error?.message || error) });
+    }
+  }
+  return { url: location.href, pageText: pageText.slice(0, 5000), selectorResults };
+}
+
 function normalizeOutcomeEventInput(input, { opportunity, proposalDrafts, outcomeEvents }) {
   const now = new Date().toISOString();
   const eventType = normalizeText(input.eventType || input.event_type);
@@ -2826,7 +3237,9 @@ function flatMapSourceRefs(items) {
     .flatMap((item) => Array.isArray(item?.sourceRefs) ? item.sourceRefs : (Array.isArray(item?.source_refs) ? item.source_refs : []));
 }
 
-function createProfileRecord({ id, opportunityId, rawProfile, model, inputSnapshotIds, version, createdAt }) {
+function createProfileRecord({ id, opportunityId, rawProfile, model, inputSnapshotIds, version, createdAt, selectorMatches = [] }) {
+  const fields = mapRawProfileFields(rawProfile, createdAt);
+  applySelectorMatchesToProfileFields(fields, selectorMatches, createdAt);
   return {
     id,
     opportunityId,
@@ -2838,13 +3251,56 @@ function createProfileRecord({ id, opportunityId, rawProfile, model, inputSnapsh
     promptVersion: PROMPT_VERSIONS.extractPromptVersion,
     scoreVersion: "not_applicable",
     inputSnapshotIds,
-    fields: mapRawProfileFields(rawProfile, createdAt),
+    fields,
     missingFieldKeys: normalizeMissingProfileFieldKeys(rawProfile?.missing_fields),
     conflicts: [],
     reviewedAt: null,
     reviewedBy: null,
     rawProfile
   };
+}
+
+function applySelectorMatchesToProfileFields(fields, selectorMatches, createdAt) {
+  for (const match of selectorMatches || []) {
+    const definition = PROFILE_FIELD_DEFINITIONS.find((item) => item.key === match.fieldKey);
+    if (!definition) continue;
+    const value = normalizeProfileFieldValue(match.text, definition.valueKind);
+    if (isEmptyProfileValue(value)) continue;
+    const current = fields[definition.key] || {
+      valueKind: definition.valueKind,
+      sources: [],
+      evidenceRefs: []
+    };
+    const selectorSource = {
+      source: "selector",
+      value,
+      confidence: 1,
+      evidenceRefs: [{
+        sourceType: "snapshot_evidence",
+        sourceId: match.snapshotId || null,
+        fieldKey: definition.key,
+        label: `Selector ${definition.label}`,
+        quote: Array.isArray(value) ? value.join(", ") : String(value)
+      }],
+      snapshotId: match.snapshotId || null,
+      selectorId: match.selectorId || null,
+      createdAt
+    };
+    fields[definition.key] = {
+      ...current,
+      value,
+      valueKind: definition.valueKind,
+      effectiveSource: "selector",
+      sources: [
+        ...(current.sources || []).filter((source) => source.selectorId !== match.selectorId),
+        selectorSource
+      ],
+      confidence: 1,
+      evidenceRefs: selectorSource.evidenceRefs,
+      correctedAt: current.correctedAt || null,
+      correctedBy: current.correctedBy || null
+    };
+  }
 }
 
 function createScoreRecord({ id, opportunityId, rawScore, model, inputSnapshotIds, inputProfileId, inputProfileVersion, notesRevisionId, profileReviewed, personalContext, createdAt }) {
@@ -3118,7 +3574,8 @@ async function readStore() {
     STORAGE_KEYS.noteRevisions,
     STORAGE_KEYS.proposalDrafts,
     STORAGE_KEYS.outcomeEvents,
-    STORAGE_KEYS.clientRecords
+    STORAGE_KEYS.clientRecords,
+    STORAGE_KEYS.fieldSelectors
   ]);
   return {
     meta: data[STORAGE_KEYS.meta] || null,
@@ -3129,7 +3586,8 @@ async function readStore() {
     noteRevisions: data[STORAGE_KEYS.noteRevisions] || [],
     proposalDrafts: data[STORAGE_KEYS.proposalDrafts] || [],
     outcomeEvents: data[STORAGE_KEYS.outcomeEvents] || [],
-    clientRecords: data[STORAGE_KEYS.clientRecords] || []
+    clientRecords: data[STORAGE_KEYS.clientRecords] || [],
+    fieldSelectors: data[STORAGE_KEYS.fieldSelectors] || []
   };
 }
 
@@ -3142,7 +3600,8 @@ async function writeStore(store) {
     [STORAGE_KEYS.noteRevisions]: store.noteRevisions,
     [STORAGE_KEYS.proposalDrafts]: store.proposalDrafts || [],
     [STORAGE_KEYS.outcomeEvents]: store.outcomeEvents || [],
-    [STORAGE_KEYS.clientRecords]: store.clientRecords || []
+    [STORAGE_KEYS.clientRecords]: store.clientRecords || [],
+    [STORAGE_KEYS.fieldSelectors]: store.fieldSelectors || []
   });
   await bumpStorageRevision();
 }
@@ -3229,6 +3688,7 @@ function validateImportData(importPayload) {
   const proposalDrafts = requireArray(data[STORAGE_KEYS.proposalDrafts] || [], STORAGE_KEYS.proposalDrafts);
   const outcomeEvents = requireArray(data[STORAGE_KEYS.outcomeEvents] || [], STORAGE_KEYS.outcomeEvents);
   const clientRecords = requireArray(data[STORAGE_KEYS.clientRecords] || [], STORAGE_KEYS.clientRecords);
+  const fieldSelectors = requireArray(data[STORAGE_KEYS.fieldSelectors] || [], STORAGE_KEYS.fieldSelectors);
   validateEntityShape(opportunities, IMPORT_ENTITY_SCHEMAS.opportunity);
   validateEntityShape(snapshots, IMPORT_ENTITY_SCHEMAS.snapshot);
   validateEntityShape(profiles, IMPORT_ENTITY_SCHEMAS.opportunityProfile);
@@ -3239,7 +3699,8 @@ function validateImportData(importPayload) {
   validateEntityShape(proposalDrafts, IMPORT_ENTITY_SCHEMAS.proposalDraft);
   validateEntityShape(outcomeEvents, IMPORT_ENTITY_SCHEMAS.outcomeEvent);
   validateEntityShape(clientRecords, IMPORT_ENTITY_SCHEMAS.clientRecord);
-  validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents, clientRecords });
+  validateEntityShape(fieldSelectors, IMPORT_ENTITY_SCHEMAS.fieldSelector);
+  validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents, clientRecords, fieldSelectors });
 
   return {
     schemaVersion: manifest.schemaVersion,
@@ -3253,7 +3714,8 @@ function validateImportData(importPayload) {
       portfolioCases: portfolioCases.length,
       proposalDrafts: proposalDrafts.length,
       outcomeEvents: outcomeEvents.length,
-      clientRecords: clientRecords.length
+      clientRecords: clientRecords.length,
+      fieldSelectors: fieldSelectors.length
     }
   };
 }
@@ -3308,6 +3770,11 @@ const IMPORT_ENTITY_SCHEMAS = Object.freeze({
     name: "ClientRecord",
     required: ["id", "schemaVersion", "createdAt", "updatedAt", "primaryClientKey", "identitySources", "displayName", "notes", "redFlags", "mergeHistory", "splitHistory"],
     allowed: ["id", "schemaVersion", "createdAt", "updatedAt", "primaryClientKey", "identitySources", "displayName", "notes", "redFlags", "mergeHistory", "splitHistory", "archivedAt"]
+  },
+  fieldSelector: {
+    name: "FieldSelector",
+    required: ["id", "schemaVersion", "createdAt", "updatedAt", "host", "pageType", "fieldKey", "selector", "sampleText", "version"],
+    allowed: ["id", "schemaVersion", "createdAt", "updatedAt", "host", "pageType", "fieldKey", "selector", "sampleText", "version", "lastUsedAt", "lastFailure", "archivedAt"]
   }
 });
 
@@ -3414,7 +3881,7 @@ function requireArray(value, name) {
   return value;
 }
 
-function validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents, clientRecords }) {
+function validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents, clientRecords, fieldSelectors }) {
   const opportunityIds = new Set(opportunities.map((item) => item.id));
   const snapshotIds = new Set(snapshots.map((item) => item.id));
   const profileIds = new Set(profiles.map((item) => item.id));
@@ -3425,6 +3892,7 @@ function validateReferences({ opportunities, snapshots, profiles, scores, notes,
   const outcomeEventIds = new Set(outcomeEvents.map((item) => item.id));
   const clientRecordIds = new Set(clientRecords.map((item) => item.id));
   validateClientRecordsForImport(clientRecords, { opportunityIds, snapshotIds });
+  validateFieldSelectorsForImport(fieldSelectors);
   for (const opportunity of opportunities) {
     for (const snapshotId of opportunity.snapshotIds || []) {
       if (!snapshotIds.has(snapshotId)) throw new Error(`Opportunity ${opportunity.id} references missing snapshot`);
@@ -3482,6 +3950,16 @@ function validateReferences({ opportunities, snapshots, profiles, scores, notes,
       const detectedStatus = event.payload?.detectedStatus || event.payload?.detected_status;
       if (!OUTCOME_STATUSES.includes(detectedStatus)) throw new Error(`OutcomeEvent ${event.id} has unsupported detectedStatus`);
     }
+  }
+}
+
+function validateFieldSelectorsForImport(fieldSelectors) {
+  for (const fieldSelector of fieldSelectors) {
+    if (!PROFILE_FIELD_KEYS.includes(fieldSelector.fieldKey)) throw new Error(`FieldSelector ${fieldSelector.id} has unsupported fieldKey`);
+    if (!normalizeText(fieldSelector.host)) throw new Error(`FieldSelector ${fieldSelector.id} missing host`);
+    if (!normalizeText(fieldSelector.pageType)) throw new Error(`FieldSelector ${fieldSelector.id} missing pageType`);
+    if (!normalizeText(fieldSelector.selector)) throw new Error(`FieldSelector ${fieldSelector.id} missing selector`);
+    if (!Number.isFinite(Number(fieldSelector.version)) || Number(fieldSelector.version) < 1) throw new Error(`FieldSelector ${fieldSelector.id} has invalid version`);
   }
 }
 
