@@ -12,6 +12,7 @@ const detailsPanel = document.querySelector("#detailsPanel");
 
 let opportunities = [];
 let selectedId = null;
+let selectedOpportunity = null;
 
 init();
 
@@ -24,7 +25,7 @@ function bindEvents() {
   refreshButton.addEventListener("click", refresh);
   opportunitySelect.addEventListener("change", () => {
     selectedId = opportunitySelect.value;
-    renderSelected();
+    loadSelected();
   });
   captureButton.addEventListener("click", captureCurrentPage);
   scoreButton.addEventListener("click", scoreSelected);
@@ -33,12 +34,21 @@ function bindEvents() {
 }
 
 async function refresh() {
-  const response = await send({ type: "opportunities:list" });
+  const response = await send({ type: "opportunities:listSummary" });
   opportunities = response.opportunities || [];
   if (!selectedId || !opportunities.some((item) => item.id === selectedId)) {
     selectedId = opportunities[0]?.id || "";
   }
   renderOpportunitySelect();
+  await loadSelected();
+}
+
+async function loadSelected() {
+  selectedOpportunity = null;
+  if (selectedId) {
+    const response = await send({ type: "opportunities:get", id: selectedId });
+    selectedOpportunity = response.opportunity || null;
+  }
   renderSelected();
 }
 
@@ -63,6 +73,7 @@ async function scoreSelected() {
   setBusy(true);
   try {
     const response = await send({ type: "score:opportunity", opportunityId: selectedId });
+    selectedOpportunity = response.opportunity;
     const index = opportunities.findIndex((item) => item.id === selectedId);
     if (index >= 0) opportunities[index] = response.opportunity;
     setStatus("Score updated");
@@ -77,8 +88,8 @@ async function scoreSelected() {
 async function deleteSelected() {
   if (!selectedId) return;
   const opportunity = getSelected();
-  if (!confirm(`Delete "${opportunity?.title || "this opportunity"}"?`)) return;
-  await send({ type: "opportunities:delete", id: selectedId });
+  if (!confirm(`Archive "${opportunity?.title || "this opportunity"}"?`)) return;
+  await send({ type: "opportunities:archive", id: selectedId });
   selectedId = "";
   await refresh();
 }
@@ -140,7 +151,7 @@ function renderSummary(opportunity) {
       </div>
       <div>
         <span class="muted">Snapshots</span>
-        <strong>${opportunity.snapshots?.length || 0}</strong>
+        <strong>${opportunity.snapshots?.length || opportunity.snapshotCount || 0}</strong>
       </div>
     </div>
     <h2>${escapeHtml(opportunity.title)}</h2>
@@ -164,7 +175,7 @@ function renderSnapshots(opportunity) {
     item.innerHTML = `
       <strong>${escapeHtml(snapshot.pageType)}</strong>
       <span>${escapeHtml(new Date(snapshot.capturedAt).toLocaleString())}</span>
-      <small>${escapeHtml(snapshot.title)}</small>
+      <small>${escapeHtml(snapshot.pageTitle || snapshot.title)}</small>
       <small>${escapeHtml(snapshot.stats?.capturedCharCount || 0)} chars</small>
     `;
     snapshotsList.append(item);
@@ -222,7 +233,7 @@ function renderList(title, values) {
 }
 
 function getSelected() {
-  return opportunities.find((item) => item.id === selectedId) || null;
+  return selectedOpportunity || opportunities.find((item) => item.id === selectedId) || null;
 }
 
 function setBusy(isBusy) {
@@ -235,7 +246,7 @@ function setStatus(message) {
 }
 
 function scoreLabel(opportunity) {
-  const score = opportunity.scoreResult?.total_score;
+  const score = opportunity.scoreResult?.total_score ?? opportunity.currentScore?.totalScore;
   return Number.isFinite(score) ? `${Math.round(score)}/100` : "Draft";
 }
 

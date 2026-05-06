@@ -21,7 +21,7 @@ function bindEvents() {
 }
 
 async function refresh() {
-  const response = await send({ type: "opportunities:list" });
+  const response = await send({ type: "opportunities:listSummary" });
   opportunities = response.opportunities || [];
   renderOpportunitySelect();
   renderRecentList();
@@ -91,7 +91,7 @@ function setBusy(isBusy, label) {
 }
 
 function scoreLabel(opportunity) {
-  const score = opportunity.scoreResult?.total_score;
+  const score = opportunity.scoreResult?.total_score ?? opportunity.currentScore?.totalScore;
   return Number.isFinite(score) ? `${Math.round(score)}/100` : "Draft";
 }
 

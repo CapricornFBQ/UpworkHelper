@@ -5,6 +5,7 @@ Local Chrome MV3 extension for manually capturing Upwork pages into opportunity 
 ## Current scope
 
 - User-triggered DOM capture only.
+- Capture is limited to `https://www.upwork.com/*` in the current version.
 - No automatic refresh, crawling, bulk scanning, or proposal submission.
 - One opportunity can contain multiple page snapshots.
 - OpenAI API key is stored in Chrome local extension storage and only used by the background service worker.
@@ -48,3 +49,4 @@ The extension is intentionally manual:
 - It does not poll or monitor page changes.
 - It does not open pages automatically.
 - It does not click, message, or submit proposals.
+- It does not call Upwork private APIs.
