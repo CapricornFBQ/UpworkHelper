@@ -11,7 +11,14 @@ import {
   SNAPSHOT_RETENTION_STATE,
   STORAGE_KEYS
 } from "../src/shared/schema.js";
-import { mapRawProfileFields, normalizeRawScore } from "../src/shared/adapters.js";
+import {
+  PROFILE_FIELD_DEFINITIONS,
+  buildEffectiveProfile,
+  mapRawProfileFields,
+  normalizeMissingProfileFieldKeys,
+  normalizeRawScore,
+  profileFieldsToLegacyRawProfile
+} from "../src/shared/adapters.js";
 
 const jsFiles = [
   "src/shared/schema.js",
@@ -32,7 +39,7 @@ for (const file of jsFiles) {
 assert.equal(SCHEMA_VERSION, 1);
 assert.equal(DEFAULT_SETTINGS.captureMode, "strict_upwork");
 assert.equal(PLATFORM_HOSTS.upwork, "www.upwork.com");
-assert.equal(PLAN_VERSION, "0.2.0");
+assert.equal(PLAN_VERSION, "0.3.0");
 assert.equal(OPPORTUNITY_STATUS.draft, "draft");
 assert.equal(OPPORTUNITY_STATUS.captured, "captured");
 assert.equal(SNAPSHOT_RETENTION_STATE.deletedReferenceOnly, "deleted_reference_only");
@@ -55,6 +62,10 @@ assert.equal(mappedProfile.descriptionSummary.value, "Build an MV3 extension");
 assert.equal(mappedProfile.requiredSkills.value.length, 2);
 assert.equal(mappedProfile.proposalCountText.value, "5 to 10");
 assert.equal(mappedProfile.job_description_summary, undefined);
+assert.equal(PROFILE_FIELD_DEFINITIONS.some((definition) => definition.key === "jobTitle"), true);
+assert.equal(buildEffectiveProfile({ fields: mappedProfile }).jobTitle, "Chrome extension engineer");
+assert.equal(profileFieldsToLegacyRawProfile({ fields: mappedProfile }).title, "Chrome extension engineer");
+assert.deepEqual(normalizeMissingProfileFieldKeys(["client_hire_rate", "jobTitle"]), ["clientHireRateText", "jobTitle"]);
 
 const fakeScore = {
   total_score: 125,
@@ -207,9 +218,10 @@ await runCaptureTests();
 await runSnapshotRetentionTests();
 await runArchiveRestoreDeleteTests();
 await runNotesStaleTests();
+await runProfileReviewTests();
 await runScoreTests();
 
-console.log("v0.2 validation passed");
+console.log("v0.3 validation passed");
 
 async function runSettingsExportBackupTests() {
   const harness = await loadBackgroundForValidation({
@@ -497,6 +509,61 @@ async function runNotesStaleTests() {
   assert.equal(detail.opportunity.scoreStale, true);
   assert.equal(detail.opportunity.currentScore.scoreStale, true);
   assert.equal(detail.opportunity.scoreResult.scoreStale, true);
+}
+
+async function runProfileReviewTests() {
+  const harness = await loadBackgroundForValidation({
+    storageData: makeScoreStorageData("opp_profile"),
+    fetchResponses: [
+      openAIText(fakeProfile),
+      ({ init }) => {
+        const request = JSON.parse(init.body);
+        const prompt = request.input[0].content[0].text;
+        assert.match(prompt, /Corrected extension engineer/);
+        assert.doesNotMatch(prompt, /Chrome extension engineer/);
+        return openAIText(fakeScore);
+      }
+    ]
+  });
+
+  const extracted = await harness({ type: "profile:extract", opportunityId: "opp_profile" });
+  assert.equal(extracted.ok, true);
+  assert.equal(harness.storageData[STORAGE_KEYS.opportunityProfiles].length, 1);
+  assert.equal(extracted.opportunity.profile.profileReviewed, false);
+  assert.equal(extracted.opportunity.profile.fields.jobTitle.value, "Chrome extension engineer");
+  assert.equal(extracted.opportunity.profile.missingFieldKeys.includes("clientHireRateText"), true);
+
+  const profile = await harness({ type: "profile:getExtracted", opportunityId: "opp_profile" });
+  assert.equal(profile.ok, true);
+  assert.equal(profile.profile.effectiveProfile.jobTitle, "Chrome extension engineer");
+
+  const corrected = await harness({
+    type: "profile:saveCorrections",
+    opportunityId: "opp_profile",
+    fields: {
+      jobTitle: "Corrected extension engineer",
+      descriptionSummary: "Corrected MV3 build",
+      requiredSkills: ["MV3", "Storage"]
+    }
+  });
+  assert.equal(corrected.ok, true);
+  assert.equal(corrected.opportunity.title, "Corrected extension engineer");
+  assert.equal(corrected.opportunity.profile.profileReviewed, true);
+  assert.equal(corrected.opportunity.effectiveProfile.jobTitle, "Corrected extension engineer");
+  assert.equal(corrected.opportunity.profile.fields.jobTitle.effectiveSource, "user_corrected");
+  assert.equal(corrected.opportunity.profile.conflicts.some((item) => item.fieldKey === "jobTitle"), true);
+
+  const scored = await harness({ type: "score:opportunity", opportunityId: "opp_profile" });
+  assert.equal(scored.ok, true);
+  assert.equal(harness.storageData[STORAGE_KEYS.opportunityProfiles].length, 1);
+  assert.equal(harness.storageData[STORAGE_KEYS.scoreResults][0].profileReviewed, true);
+  assert.equal(harness.storageData[STORAGE_KEYS.scoreResults][0].inputProfileId, harness.storageData[STORAGE_KEYS.opportunityProfiles][0].id);
+
+  const cleared = await harness({ type: "profile:clearCorrections", opportunityId: "opp_profile" });
+  assert.equal(cleared.ok, true);
+  assert.equal(cleared.opportunity.profile.profileReviewed, false);
+  assert.equal(cleared.opportunity.profile.conflicts.length, 0);
+  assert.equal(cleared.opportunity.effectiveProfile.jobTitle, "Chrome extension engineer");
 }
 
 async function runScoreTests() {

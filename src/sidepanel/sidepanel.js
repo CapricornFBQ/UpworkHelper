@@ -1,3 +1,5 @@
+import { PROFILE_FIELD_DEFINITIONS } from "../shared/adapters.js";
+
 const panelStatus = document.querySelector("#panelStatus");
 const opportunitySelect = document.querySelector("#opportunitySelect");
 const captureButton = document.querySelector("#captureButton");
@@ -7,6 +9,12 @@ const permanentDeleteButton = document.querySelector("#permanentDeleteButton");
 const refreshButton = document.querySelector("#refreshButton");
 const notesInput = document.querySelector("#notesInput");
 const saveNotesButton = document.querySelector("#saveNotesButton");
+const extractProfileButton = document.querySelector("#extractProfileButton");
+const saveProfileButton = document.querySelector("#saveProfileButton");
+const clearProfileButton = document.querySelector("#clearProfileButton");
+const profileReviewBadge = document.querySelector("#profileReviewBadge");
+const profileFieldsPanel = document.querySelector("#profileFieldsPanel");
+const profileConflictsPanel = document.querySelector("#profileConflictsPanel");
 const summaryPanel = document.querySelector("#summaryPanel");
 const snapshotsList = document.querySelector("#snapshotsList");
 const detailsPanel = document.querySelector("#detailsPanel");
@@ -33,6 +41,9 @@ function bindEvents() {
   deleteButton.addEventListener("click", deleteSelected);
   permanentDeleteButton.addEventListener("click", permanentDeleteSelected);
   saveNotesButton.addEventListener("click", saveNotes);
+  extractProfileButton.addEventListener("click", extractProfile);
+  saveProfileButton.addEventListener("click", saveProfileCorrections);
+  clearProfileButton.addEventListener("click", clearProfileCorrections);
 }
 
 async function refresh() {
@@ -135,6 +146,62 @@ async function saveNotes() {
   }
 }
 
+async function extractProfile() {
+  if (!selectedId) return;
+  setStatus("Extracting fields...");
+  setBusy(true);
+  try {
+    const response = await send({ type: "profile:extract", opportunityId: selectedId });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Fields extracted");
+    renderSelected();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function saveProfileCorrections() {
+  if (!selectedId) return;
+  setStatus("Saving profile corrections...");
+  setBusy(true);
+  try {
+    const response = await send({
+      type: "profile:saveCorrections",
+      opportunityId: selectedId,
+      fields: collectProfileFieldValues()
+    });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Profile corrections saved");
+    renderSelected();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function clearProfileCorrections() {
+  if (!selectedId) return;
+  if (!confirm("Clear user profile corrections and return to AI extracted values?")) return;
+  setStatus("Clearing profile corrections...");
+  setBusy(true);
+  try {
+    const response = await send({ type: "profile:clearCorrections", opportunityId: selectedId });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Profile corrections cleared");
+    renderSelected();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function renderOpportunitySelect() {
   opportunitySelect.innerHTML = "";
   if (!opportunities.length) {
@@ -166,11 +233,13 @@ function renderSelected() {
     snapshotsList.textContent = "No snapshots.";
     detailsPanel.textContent = "No score yet.";
     notesInput.value = "";
+    renderProfileEditor(null);
     return;
   }
 
   notesInput.value = opportunity.notes || "";
   renderSummary(opportunity);
+  renderProfileEditor(opportunity);
   renderSnapshots(opportunity);
   renderDetails(opportunity);
 }
@@ -179,6 +248,9 @@ function renderSummary(opportunity) {
   const score = opportunity.scoreResult?.total_score;
   const decision = opportunity.scoreResult?.decision_summary || "Not scored yet.";
   const staleWarning = opportunity.scoreStale ? "<p class=\"warning\">Notes changed after this score. Re-score recommended.</p>" : "";
+  const profileWarning = opportunity.profile && !opportunity.profile.reviewedAt
+    ? "<p class=\"warning\">Extracted fields are not reviewed. Score confidence may be lower.</p>"
+    : "";
   summaryPanel.innerHTML = `
     <div class="score-card">
       <div>
@@ -193,8 +265,74 @@ function renderSummary(opportunity) {
     <h2>${escapeHtml(opportunity.title)}</h2>
     <p>${escapeHtml(decision)}</p>
     ${staleWarning}
+    ${profileWarning}
     <a href="${escapeAttribute(opportunity.mainUrl)}" target="_blank" rel="noreferrer">Open source page</a>
   `;
+}
+
+function renderProfileEditor(opportunity) {
+  const profile = opportunity?.profile || null;
+  extractProfileButton.disabled = !opportunity;
+  saveProfileButton.disabled = !profile;
+  clearProfileButton.disabled = !profile || !profile.reviewedAt;
+
+  if (!opportunity) {
+    profileReviewBadge.className = "badge";
+    profileReviewBadge.textContent = "Not extracted";
+    profileFieldsPanel.className = "profile-fields empty";
+    profileFieldsPanel.textContent = "No extracted fields.";
+    profileConflictsPanel.className = "list empty";
+    profileConflictsPanel.textContent = "No conflicts.";
+    return;
+  }
+
+  if (!profile) {
+    profileReviewBadge.className = "badge";
+    profileReviewBadge.textContent = "Not extracted";
+    profileFieldsPanel.className = "profile-fields empty";
+    profileFieldsPanel.textContent = "Extract fields before scoring or editing profile data.";
+    profileConflictsPanel.className = "list empty";
+    profileConflictsPanel.textContent = "No conflicts.";
+    return;
+  }
+
+  profileReviewBadge.className = `badge${profile.reviewedAt ? " reviewed" : ""}`;
+  profileReviewBadge.textContent = profile.reviewedAt ? "Reviewed" : "Needs review";
+  profileFieldsPanel.className = "profile-fields";
+  profileFieldsPanel.innerHTML = PROFILE_FIELD_DEFINITIONS.map((definition) => {
+    const field = profile.fields?.[definition.key] || {};
+    const value = formatProfileFieldValue(field.value, definition.valueKind);
+    const source = field.effectiveSource || "missing";
+    const rows = definition.valueKind === "array" || value.length > 90 ? 3 : 2;
+    return `
+      <label class="profile-field">
+        ${escapeHtml(definition.label)}
+        <small>${escapeHtml(sourceLabel(source))}</small>
+        <textarea data-profile-field="${escapeAttribute(definition.key)}" rows="${rows}">${escapeHtml(value)}</textarea>
+      </label>
+    `;
+  }).join("");
+  renderProfileConflicts(profile.conflicts || []);
+}
+
+function renderProfileConflicts(conflicts) {
+  if (!conflicts.length) {
+    profileConflictsPanel.className = "list empty";
+    profileConflictsPanel.textContent = "No conflicts.";
+    return;
+  }
+  profileConflictsPanel.className = "list";
+  profileConflictsPanel.innerHTML = conflicts.map((conflict) => {
+    const values = (conflict.sources || []).map((source) => (
+      `<small>${escapeHtml(sourceLabel(source.source))}: ${escapeHtml(formatProfileFieldValue(source.value))}</small>`
+    )).join("");
+    return `
+      <div class="conflict">
+        <strong>${escapeHtml(conflict.label || conflict.fieldKey)}</strong>
+        ${values}
+      </div>
+    `;
+  }).join("");
 }
 
 function renderSnapshots(opportunity) {
@@ -228,6 +366,9 @@ function renderDetails(opportunity) {
   }
   detailsPanel.className = "details";
   const staleWarning = (opportunity.scoreStale || score.scoreStale) ? "<p class=\"warning\">Notes changed after this score. Re-score recommended.</p>" : "";
+  const profileReviewedWarning = score.profileReviewed === false
+    ? "<p class=\"warning\">Score used unreviewed extracted fields.</p>"
+    : "";
   const dimensions = (score.dimensions || []).map((dimension) => `
     <article class="dimension">
       <header>
@@ -242,6 +383,7 @@ function renderDetails(opportunity) {
 
   detailsPanel.innerHTML = `
     ${staleWarning}
+    ${profileReviewedWarning}
     <div class="decision ${escapeHtml(score.decision)}">
       <strong>${escapeHtml(score.decision)}</strong>
       <p>${escapeHtml(score.decision_summary)}</p>
@@ -271,6 +413,38 @@ function renderList(title, values) {
   `;
 }
 
+function collectProfileFieldValues() {
+  const values = {};
+  for (const definition of PROFILE_FIELD_DEFINITIONS) {
+    const input = profileFieldsPanel.querySelector(`[data-profile-field="${definition.key}"]`);
+    if (!input) continue;
+    values[definition.key] = definition.valueKind === "array"
+      ? input.value.split(/\n|,/).map((item) => item.trim()).filter(Boolean)
+      : input.value.trim();
+  }
+  return values;
+}
+
+function formatProfileFieldValue(value) {
+  return Array.isArray(value) ? value.join("\n") : String(value || "");
+}
+
+function sourceLabel(source) {
+  const labels = {
+    ai_extracted: "AI extracted",
+    user_corrected: "User corrected",
+    selector: "Selector",
+    manual_note: "Manual note",
+    missing: "Missing"
+  };
+  return labels[source] || source;
+}
+
+function updateOpportunitySummary(opportunity) {
+  const index = opportunities.findIndex((item) => item.id === opportunity.id);
+  if (index >= 0) opportunities[index] = opportunity;
+}
+
 function getSelected() {
   return selectedOpportunity || opportunities.find((item) => item.id === selectedId) || null;
 }
@@ -281,6 +455,9 @@ function setBusy(isBusy) {
   deleteButton.disabled = isBusy || !selectedId;
   permanentDeleteButton.disabled = isBusy || !selectedId;
   saveNotesButton.disabled = isBusy || !selectedId;
+  extractProfileButton.disabled = isBusy || !selectedId;
+  saveProfileButton.disabled = isBusy || !selectedOpportunity?.profile;
+  clearProfileButton.disabled = isBusy || !selectedOpportunity?.profile?.reviewedAt;
 }
 
 function setStatus(message) {

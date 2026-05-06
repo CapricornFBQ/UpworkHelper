@@ -17,6 +17,7 @@ const port = Number(process.env.UOSC_CDP_PORT || 47000 + Math.floor(Math.random(
 const userDataDir = mkdtempSync(join(tmpdir(), "uosc-extension-smoke-"));
 const headless = process.env.UOSC_SMOKE_HEADLESS !== "0";
 const smokeOpportunityId = "opp_smoke_notes_failure";
+const smokeProfileId = "profile_smoke_notes_failure";
 let chromeProcess = null;
 let client = null;
 
@@ -133,6 +134,11 @@ async function smokeSidePanelPage(extensionId) {
     "#refreshButton",
     "#notesInput",
     "#saveNotesButton",
+    "#extractProfileButton",
+    "#saveProfileButton",
+    "#clearProfileButton",
+    "#profileFieldsPanel",
+    "#profileConflictsPanel",
     "#panelStatus"
   ]), true);
 
@@ -142,6 +148,10 @@ async function smokeSidePanelPage(extensionId) {
     return evaluate(page.sessionId, `
       document.querySelector("#opportunitySelect").value === ${JSON.stringify(smokeOpportunityId)} &&
       document.querySelector("#notesInput").value === "" &&
+      document.querySelector("#profileReviewBadge").textContent === "Reviewed" &&
+      document.querySelector('[data-profile-field="jobTitle"]').value === "Corrected smoke title" &&
+      document.querySelector("#profileConflictsPanel").textContent.includes("AI extracted") &&
+      document.querySelector("#profileConflictsPanel").textContent.includes("Corrected smoke title") &&
       !document.querySelector("#saveNotesButton").disabled
     `);
   });
@@ -191,13 +201,68 @@ async function seedSmokeOpportunity(sessionId) {
         platform: "upwork",
         status: OPPORTUNITY_STATUS.captured,
         snapshotIds: [],
-        currentProfileId: null,
+        currentProfileId: smokeProfileId,
         currentScoreResultId: null,
         currentNotesRevisionId: null,
         archivedAt: null
       }],
       [STORAGE_KEYS.snapshots]: [],
-      [STORAGE_KEYS.opportunityProfiles]: [],
+      [STORAGE_KEYS.opportunityProfiles]: [{
+        id: smokeProfileId,
+        opportunityId: smokeOpportunityId,
+        schemaVersion: SCHEMA_VERSION,
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+        model: "smoke-model",
+        promptVersion: "extract_v1",
+        scoreVersion: "not_applicable",
+        inputSnapshotIds: [],
+        fields: {
+          jobTitle: {
+            value: "Corrected smoke title",
+            valueKind: "text",
+            effectiveSource: "user_corrected",
+            sources: [
+              {
+                source: "ai_extracted",
+                value: "AI smoke title",
+                confidence: null,
+                evidenceRefs: [],
+                snapshotId: null,
+                selectorId: null,
+                createdAt: now
+              },
+              {
+                source: "user_corrected",
+                value: "Corrected smoke title",
+                confidence: 1,
+                evidenceRefs: [],
+                snapshotId: null,
+                selectorId: null,
+                createdAt: now
+              }
+            ],
+            confidence: 1,
+            evidenceRefs: [],
+            correctedAt: now,
+            correctedBy: "user"
+          }
+        },
+        missingFieldKeys: [],
+        conflicts: [{
+          fieldKey: "jobTitle",
+          label: "Job title",
+          selectedSource: "user_corrected",
+          sources: [
+            { source: "ai_extracted", value: "AI smoke title", confidence: null },
+            { source: "user_corrected", value: "Corrected smoke title", confidence: 1 }
+          ]
+        }],
+        reviewedAt: now,
+        reviewedBy: "user",
+        rawProfile: { title: "AI smoke title", missing_fields: [] }
+      }],
       [STORAGE_KEYS.scoreResults]: [],
       [STORAGE_KEYS.noteRevisions]: [],
       [STORAGE_KEYS.myProfile]: null,

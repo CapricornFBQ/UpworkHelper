@@ -17,7 +17,7 @@ Local Chrome MV3 extension for manually capturing Upwork pages into opportunity 
 
 ## Validation
 
-- Core business handler regression: `node scripts/validate_v0_2.mjs`
+- Core business handler regression: `node scripts/validate_v0_3.mjs`
 - Unpacked extension smoke: `node scripts/smoke_unpacked_extension.mjs`
 
 The smoke script uses the first available Chromium-family browser and can be forced with `CHROME_PATH=/path/to/browser`.
@@ -36,7 +36,7 @@ The smoke script uses the first available Chromium-family browser and can be for
 2. Click the extension icon.
 3. Choose `New opportunity` or an existing opportunity.
 4. Click `Capture current page`.
-5. Open the side panel and click `Score`.
+5. Open the side panel, click `Extract fields`, review/correct extracted fields, then click `Score`.
 
 If an Upwork job key can be recognized from the current URL, repeated captures of the same job are automatically appended to the same opportunity.
 

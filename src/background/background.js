@@ -7,7 +7,17 @@ import {
   SNAPSHOT_RETENTION_STATE,
   STORAGE_KEYS
 } from "../shared/schema.js";
-import { mapRawProfileFields, normalizeDimensions, normalizeRawScore } from "../shared/adapters.js";
+import {
+  PROFILE_FIELD_DEFINITIONS,
+  buildEffectiveProfile,
+  isEmptyProfileValue,
+  mapRawProfileFields,
+  normalizeDimensions,
+  normalizeMissingProfileFieldKeys,
+  normalizeProfileFieldValue,
+  normalizeRawScore,
+  profileFieldsToLegacyRawProfile
+} from "../shared/adapters.js";
 
 const MAX_SNAPSHOT_CHARS = 70000;
 const MAX_SCORE_INPUT_CHARS = 110000;
@@ -83,6 +93,14 @@ async function handleMessage(message) {
     case "opportunities:updateNotes":
     case "notes:update":
       return { ok: true, opportunity: await updateOpportunityNotes(message.id || message.opportunityId, message.notes || "") };
+    case "profile:extract":
+      return { ok: true, opportunity: await extractProfileForOpportunity(message.id || message.opportunityId) };
+    case "profile:getExtracted":
+      return { ok: true, profile: await getCurrentProfileForOpportunity(message.id || message.opportunityId) };
+    case "profile:saveCorrections":
+      return { ok: true, opportunity: await saveProfileCorrections(message.id || message.opportunityId, message.fields || {}) };
+    case "profile:clearCorrections":
+      return { ok: true, opportunity: await clearProfileCorrections(message.id || message.opportunityId) };
     case "capture:currentPage":
       return captureCurrentPage(message.opportunityId || null);
     case "score:opportunity":
@@ -559,6 +577,237 @@ async function updateOpportunityNotes(id, notes) {
   });
 }
 
+async function getCurrentProfileForOpportunity(id) {
+  const detail = await getOpportunityDetail(id);
+  return detail?.profile || null;
+}
+
+async function extractProfileForOpportunity(opportunityId) {
+  const settings = await getSettings();
+  if (!settings.apiKey) throw new Error("OpenAI API key is missing. Set it in Options first.");
+
+  const extractionInput = await withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.opportunities.findIndex((item) => item.id === opportunityId);
+    if (index === -1) throw new Error("Opportunity not found");
+    const opportunity = store.opportunities[index];
+    if (opportunity.status === OPPORTUNITY_STATUS.archived) throw new Error("Archived opportunity cannot be extracted");
+    const detail = hydrateOpportunity(opportunity, store);
+    if (!detail.snapshots.length) throw new Error("No snapshots captured for this opportunity");
+    return {
+      detail,
+      snapshotIds: [...opportunity.snapshotIds],
+      currentProfileId: opportunity.currentProfileId || null,
+      status: opportunity.status
+    };
+  });
+
+  const rawProfile = await extractOpportunityProfile(extractionInput.detail, settings);
+
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.opportunities.findIndex((item) => item.id === opportunityId);
+    if (index === -1) throw new Error("Opportunity not found");
+    const opportunity = store.opportunities[index];
+    if (
+      opportunity.status === OPPORTUNITY_STATUS.archived ||
+      opportunity.status !== extractionInput.status ||
+      (opportunity.currentProfileId || null) !== extractionInput.currentProfileId ||
+      !arraysEqual(opportunity.snapshotIds, extractionInput.snapshotIds)
+    ) {
+      throw new Error("Opportunity changed while extracting profile. Re-run extraction with the latest snapshots.");
+    }
+
+    const profileVersion = store.opportunityProfiles.filter((item) => item.opportunityId === opportunityId).length + 1;
+    const createdAt = new Date().toISOString();
+    const profileRecord = createProfileRecord({
+      id: crypto.randomUUID(),
+      opportunityId,
+      rawProfile,
+      model: settings.extractModel,
+      inputSnapshotIds: extractionInput.snapshotIds,
+      version: profileVersion,
+      createdAt
+    });
+    store.opportunityProfiles.push(profileRecord);
+    store.opportunities[index] = {
+      ...opportunity,
+      currentProfileId: profileRecord.id,
+      title: getProfileTitle(profileRecord) || opportunity.title,
+      updatedAt: profileRecord.createdAt
+    };
+    await writeStore(store);
+    return hydrateOpportunity(store.opportunities[index], store);
+  });
+}
+
+async function saveProfileCorrections(opportunityId, fieldValues) {
+  if (!opportunityId) throw new Error("Opportunity id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.opportunities.findIndex((item) => item.id === opportunityId);
+    if (index === -1) throw new Error("Opportunity not found");
+    const opportunity = store.opportunities[index];
+    const profile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId);
+    if (!profile) throw new Error("Extract profile before saving corrections");
+
+    const now = new Date().toISOString();
+    const nextFields = { ...(profile.fields || {}) };
+    for (const definition of PROFILE_FIELD_DEFINITIONS) {
+      if (!Object.prototype.hasOwnProperty.call(fieldValues, definition.key)) continue;
+      nextFields[definition.key] = applyProfileCorrection({
+        field: nextFields[definition.key],
+        definition,
+        value: fieldValues[definition.key],
+        correctedAt: now
+      });
+    }
+
+    const nextProfile = {
+      ...profile,
+      fields: nextFields,
+      missingFieldKeys: buildMissingFieldKeys(nextFields),
+      conflicts: buildProfileConflicts(nextFields),
+      reviewedAt: now,
+      reviewedBy: "user",
+      updatedAt: now
+    };
+    const profileIndex = store.opportunityProfiles.findIndex((item) => item.id === profile.id);
+    store.opportunityProfiles[profileIndex] = nextProfile;
+    store.opportunities[index] = {
+      ...opportunity,
+      title: getProfileTitle(nextProfile) || opportunity.title,
+      updatedAt: now
+    };
+    await writeStore(store);
+    return hydrateOpportunity(store.opportunities[index], store);
+  });
+}
+
+async function clearProfileCorrections(opportunityId) {
+  if (!opportunityId) throw new Error("Opportunity id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.opportunities.findIndex((item) => item.id === opportunityId);
+    if (index === -1) throw new Error("Opportunity not found");
+    const opportunity = store.opportunities[index];
+    const profile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId);
+    if (!profile) throw new Error("Extract profile before clearing corrections");
+
+    const now = new Date().toISOString();
+    const fields = {};
+    for (const definition of PROFILE_FIELD_DEFINITIONS) {
+      const field = profile.fields?.[definition.key];
+      if (!field) continue;
+      const aiSource = (field.sources || []).find((source) => source.source === "ai_extracted");
+      if (!aiSource) continue;
+      const value = normalizeProfileFieldValue(aiSource.value, definition.valueKind);
+      if (isEmptyProfileValue(value)) continue;
+      fields[definition.key] = {
+        ...field,
+        value,
+        valueKind: definition.valueKind,
+        effectiveSource: "ai_extracted",
+        sources: (field.sources || []).filter((source) => source.source !== "user_corrected"),
+        confidence: aiSource.confidence ?? field.confidence ?? null,
+        correctedAt: null,
+        correctedBy: null
+      };
+    }
+
+    const nextProfile = {
+      ...profile,
+      fields,
+      missingFieldKeys: buildMissingFieldKeys(fields),
+      conflicts: [],
+      reviewedAt: null,
+      reviewedBy: null,
+      updatedAt: now
+    };
+    const profileIndex = store.opportunityProfiles.findIndex((item) => item.id === profile.id);
+    store.opportunityProfiles[profileIndex] = nextProfile;
+    store.opportunities[index] = {
+      ...opportunity,
+      title: getProfileTitle(nextProfile) || opportunity.title,
+      updatedAt: now
+    };
+    await writeStore(store);
+    return hydrateOpportunity(store.opportunities[index], store);
+  });
+}
+
+function applyProfileCorrection({ field, definition, value, correctedAt }) {
+  const normalizedValue = normalizeProfileFieldValue(value, definition.valueKind);
+  const existingSources = Array.isArray(field?.sources) ? field.sources : [];
+  const userSource = {
+    source: "user_corrected",
+    value: normalizedValue,
+    confidence: 1,
+    evidenceRefs: [],
+    snapshotId: null,
+    selectorId: null,
+    createdAt: correctedAt
+  };
+  return {
+    ...(field || {}),
+    value: normalizedValue,
+    valueKind: definition.valueKind,
+    effectiveSource: "user_corrected",
+    sources: [
+      ...existingSources.filter((source) => source.source !== "user_corrected"),
+      userSource
+    ],
+    confidence: 1,
+    evidenceRefs: field?.evidenceRefs || [],
+    correctedAt,
+    correctedBy: "user"
+  };
+}
+
+function buildMissingFieldKeys(fields) {
+  return PROFILE_FIELD_DEFINITIONS
+    .filter((definition) => isEmptyProfileValue(fields?.[definition.key]?.value))
+    .map((definition) => definition.key);
+}
+
+function buildProfileConflicts(fields) {
+  const conflicts = [];
+  for (const definition of PROFILE_FIELD_DEFINITIONS) {
+    const field = fields?.[definition.key];
+    if (!field) continue;
+    const aiSource = (field.sources || []).find((source) => source.source === "ai_extracted");
+    const userSource = (field.sources || []).find((source) => source.source === "user_corrected");
+    if (!aiSource || !userSource) continue;
+    const aiValue = normalizeProfileFieldValue(aiSource.value, definition.valueKind);
+    const userValue = normalizeProfileFieldValue(userSource.value, definition.valueKind);
+    if (profileValuesEqual(aiValue, userValue)) continue;
+    conflicts.push({
+      fieldKey: definition.key,
+      label: definition.label,
+      selectedSource: "user_corrected",
+      sources: [
+        { source: "ai_extracted", value: aiValue, confidence: aiSource.confidence ?? null },
+        { source: "user_corrected", value: userValue, confidence: userSource.confidence ?? 1 }
+      ]
+    });
+  }
+  return conflicts;
+}
+
+function profileValuesEqual(left, right) {
+  if (Array.isArray(left) || Array.isArray(right)) {
+    const leftArray = Array.isArray(left) ? left : normalizeProfileFieldValue(left, "array");
+    const rightArray = Array.isArray(right) ? right : normalizeProfileFieldValue(right, "array");
+    return arraysEqual(leftArray, rightArray);
+  }
+  return String(left || "") === String(right || "");
+}
+
+function getProfileTitle(profile) {
+  const value = profile?.fields?.jobTitle?.value;
+  return Array.isArray(value) ? value.join(", ") : String(value || "").trim();
+}
+
 async function captureCurrentPage(opportunityId) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) throw new Error("No active tab found");
@@ -720,65 +969,80 @@ async function scoreOpportunity(opportunityId) {
     const opportunity = store.opportunities[index];
     const detail = hydrateOpportunity(opportunity, store);
     if (!detail.snapshots.length) throw new Error("No snapshots captured for this opportunity");
+    const currentProfile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
+    const currentProfileMatchesSnapshots = currentProfile && arraysEqual(currentProfile.inputSnapshotIds, opportunity.snapshotIds);
 
     return {
       detail,
       snapshotIds: [...opportunity.snapshotIds],
       notesRevisionId: opportunity.currentNotesRevisionId || null,
+      currentProfile: currentProfileMatchesSnapshots ? currentProfile : null,
+      currentProfileId: opportunity.currentProfileId || null,
+      currentProfileUpdatedAt: currentProfileMatchesSnapshots ? currentProfile.updatedAt : null,
+      profileCount: store.opportunityProfiles.filter((item) => item.opportunityId === opportunityId).length,
       currentScoreResultId: opportunity.currentScoreResultId || null,
       status: opportunity.status
     };
   });
 
-  const rawProfile = await extractOpportunityProfile(scoringInput.detail, settings);
-  const rawScore = await scoreOpportunityProfile(scoringInput.detail, rawProfile, settings);
+  let profileRecord = scoringInput.currentProfile;
+  let shouldCreateProfile = false;
+  if (!profileRecord) {
+    const rawProfile = await extractOpportunityProfile(scoringInput.detail, settings);
+    profileRecord = createProfileRecord({
+      id: crypto.randomUUID(),
+      opportunityId,
+      rawProfile,
+      model: settings.extractModel,
+      inputSnapshotIds: scoringInput.snapshotIds,
+      version: scoringInput.profileCount + 1,
+      createdAt: new Date().toISOString()
+    });
+    shouldCreateProfile = true;
+  }
+  const effectiveProfile = profileFieldsToLegacyRawProfile(profileRecord);
+  const rawScore = await scoreOpportunityProfile(scoringInput.detail, effectiveProfile, settings);
 
   return withStorageLock(async () => {
     const store = await readStore();
     const index = store.opportunities.findIndex((item) => item.id === opportunityId);
     if (index === -1) throw new Error("Opportunity not found");
     const opportunity = store.opportunities[index];
+    const currentProfile = store.opportunityProfiles.find((item) => item.id === opportunity.currentProfileId) || null;
     if (
       opportunity.status === OPPORTUNITY_STATUS.archived ||
       opportunity.status !== scoringInput.status ||
       (opportunity.currentScoreResultId || null) !== scoringInput.currentScoreResultId ||
+      (opportunity.currentProfileId || null) !== scoringInput.currentProfileId ||
+      (scoringInput.currentProfileUpdatedAt && currentProfile?.updatedAt !== scoringInput.currentProfileUpdatedAt) ||
       !arraysEqual(opportunity.snapshotIds, scoringInput.snapshotIds) ||
       (opportunity.currentNotesRevisionId || null) !== scoringInput.notesRevisionId
     ) {
-      throw new Error("Opportunity changed while scoring. Re-run scoring with the latest snapshots and notes.");
+      throw new Error("Opportunity changed while scoring. Re-run scoring with the latest snapshots, profile, and notes.");
     }
 
-    const profileVersion = store.opportunityProfiles.filter((item) => item.opportunityId === opportunityId).length + 1;
+    const inputProfile = shouldCreateProfile ? profileRecord : currentProfile;
+    if (!inputProfile) throw new Error("Opportunity profile not found");
+    if (shouldCreateProfile) store.opportunityProfiles.push(inputProfile);
     const createdAt = new Date().toISOString();
-    const profileRecord = createProfileRecord({
-      id: crypto.randomUUID(),
-      opportunityId,
-      rawProfile,
-      model: settings.extractModel,
-      inputSnapshotIds: scoringInput.snapshotIds,
-      version: profileVersion,
-      createdAt
-    });
-
     const scoreRecord = createScoreRecord({
       id: crypto.randomUUID(),
       opportunityId,
       rawScore,
       model: settings.scoreModel,
       inputSnapshotIds: scoringInput.snapshotIds,
-      inputProfileId: profileRecord.id,
-      inputProfileVersion: profileRecord.version,
+      inputProfileId: inputProfile.id,
+      inputProfileVersion: inputProfile.version,
       notesRevisionId: scoringInput.notesRevisionId,
-      profileReviewed: false,
+      profileReviewed: Boolean(inputProfile.reviewedAt),
       createdAt
     });
 
-    store.opportunityProfiles.push(profileRecord);
     store.scoreResults.push(scoreRecord);
     store.opportunities[index] = {
       ...opportunity,
       status: OPPORTUNITY_STATUS.scored,
-      currentProfileId: profileRecord.id,
+      currentProfileId: inputProfile.id,
       currentScoreResultId: scoreRecord.id,
       updatedAt: scoreRecord.createdAt
     };
@@ -975,8 +1239,8 @@ function createProfileRecord({ id, opportunityId, rawProfile, model, inputSnapsh
     promptVersion: PROMPT_VERSIONS.extractPromptVersion,
     scoreVersion: "not_applicable",
     inputSnapshotIds,
-    fields: mapRawProfileFields(rawProfile),
-    missingFieldKeys: rawProfile?.missing_fields || [],
+    fields: mapRawProfileFields(rawProfile, createdAt),
+    missingFieldKeys: normalizeMissingProfileFieldKeys(rawProfile?.missing_fields),
     conflicts: [],
     reviewedAt: null,
     reviewedBy: null,
@@ -1029,6 +1293,10 @@ function hydrateOpportunity(opportunity, store) {
     ...opportunity,
     snapshots,
     notes,
+    profile: profile ? toProfileViewModel(profile) : null,
+    effectiveProfile: profile ? buildEffectiveProfile(profile) : null,
+    profileReviewed: Boolean(profile?.reviewedAt),
+    profileConflicts: profile?.conflicts || [],
     extractedProfile: profile?.rawProfile || null,
     scoreStale,
     scoreResult: score ? toLegacyScoreResult(score, { scoreStale }) : null,
@@ -1046,6 +1314,14 @@ function hydrateOpportunity(opportunity, store) {
 function getCurrentNotesText(opportunity, noteRevisions) {
   const current = noteRevisions.find((item) => item.id === opportunity.currentNotesRevisionId);
   return current?.text || "";
+}
+
+function toProfileViewModel(profile) {
+  return {
+    ...profile,
+    effectiveProfile: buildEffectiveProfile(profile),
+    profileReviewed: Boolean(profile.reviewedAt)
+  };
 }
 
 function toLegacySnapshot(snapshot) {

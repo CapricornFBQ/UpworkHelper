@@ -1,34 +1,37 @@
 const SCORE_DECISIONS = ["strong_apply", "targeted_apply", "only_if_strong_fit", "skip"];
 
+export const PROFILE_FIELD_DEFINITIONS = Object.freeze([
+  { key: "jobTitle", rawKey: "title", label: "Job title", valueKind: "text" },
+  { key: "descriptionSummary", rawKey: "job_description_summary", label: "Description summary", valueKind: "text" },
+  { key: "requiredSkills", rawKey: "required_skills", label: "Required skills", valueKind: "array" },
+  { key: "budgetText", rawKey: "budget", label: "Budget", valueKind: "text" },
+  { key: "pricingType", rawKey: "hourly_or_fixed", label: "Pricing type", valueKind: "text" },
+  { key: "proposalCountText", rawKey: "proposal_count", label: "Proposal count", valueKind: "text" },
+  { key: "connectsCostText", rawKey: "connects_cost", label: "Connects cost", valueKind: "text" },
+  { key: "postedTimeText", rawKey: "posted_time", label: "Posted time", valueKind: "text" },
+  { key: "interviewsText", rawKey: "interviews", label: "Interviews", valueKind: "text" },
+  { key: "invitesSentText", rawKey: "invites_sent", label: "Invites sent", valueKind: "text" },
+  { key: "hiresText", rawKey: "hires", label: "Hires", valueKind: "text" },
+  { key: "clientPaymentVerifiedText", rawKey: "client_payment_verified", label: "Payment verified", valueKind: "text" },
+  { key: "clientRatingText", rawKey: "client_rating", label: "Client rating", valueKind: "text" },
+  { key: "clientTotalSpendText", rawKey: "client_total_spend", label: "Client total spend", valueKind: "text" },
+  { key: "clientHireRateText", rawKey: "client_hire_rate", label: "Client hire rate", valueKind: "text" },
+  { key: "clientAvgHourlyPaidText", rawKey: "client_avg_hourly_paid", label: "Avg hourly paid", valueKind: "text" },
+  { key: "clientType", rawKey: "client_type", label: "Client type", valueKind: "text" },
+  { key: "testTaskSignal", rawKey: "test_task", label: "Test task signal", valueKind: "text" },
+  { key: "longTermSignal", rawKey: "long_term_signal", label: "Long-term signal", valueKind: "text" }
+]);
+const PROFILE_FIELD_KEYS = new Set(PROFILE_FIELD_DEFINITIONS.map((definition) => definition.key));
+const RAW_PROFILE_FIELD_TO_CANONICAL = new Map(PROFILE_FIELD_DEFINITIONS.map((definition) => [definition.rawKey, definition.key]));
+
 export function mapRawProfileFields(rawProfile = {}, createdAt = new Date().toISOString()) {
-  const fieldMap = {
-    title: "jobTitle",
-    job_description_summary: "descriptionSummary",
-    required_skills: "requiredSkills",
-    budget: "budgetText",
-    hourly_or_fixed: "pricingType",
-    proposal_count: "proposalCountText",
-    connects_cost: "connectsCostText",
-    posted_time: "postedTimeText",
-    interviews: "interviewsText",
-    invites_sent: "invitesSentText",
-    hires: "hiresText",
-    client_payment_verified: "clientPaymentVerifiedText",
-    client_rating: "clientRatingText",
-    client_total_spend: "clientTotalSpendText",
-    client_hire_rate: "clientHireRateText",
-    client_avg_hourly_paid: "clientAvgHourlyPaidText",
-    client_type: "clientType",
-    test_task: "testTaskSignal",
-    long_term_signal: "longTermSignal"
-  };
   const fields = {};
-  for (const [rawKey, fieldKey] of Object.entries(fieldMap)) {
-    const value = rawProfile?.[rawKey] ?? null;
-    if (value === null || value === undefined || value === "") continue;
-    fields[fieldKey] = {
+  for (const definition of PROFILE_FIELD_DEFINITIONS) {
+    const value = normalizeProfileFieldValue(rawProfile?.[definition.rawKey], definition.valueKind);
+    if (isEmptyProfileValue(value)) continue;
+    fields[definition.key] = {
       value,
-      valueKind: Array.isArray(value) ? "array" : "text",
+      valueKind: definition.valueKind,
       effectiveSource: "ai_extracted",
       sources: [{
         source: "ai_extracted",
@@ -46,6 +49,54 @@ export function mapRawProfileFields(rawProfile = {}, createdAt = new Date().toIS
     };
   }
   return fields;
+}
+
+export function buildEffectiveProfile(profile = {}) {
+  const fields = profile.fields || {};
+  return Object.fromEntries(PROFILE_FIELD_DEFINITIONS.map((definition) => {
+    const value = normalizeProfileFieldValue(fields[definition.key]?.value, definition.valueKind);
+    return [definition.key, value];
+  }));
+}
+
+export function profileFieldsToLegacyRawProfile(profile = {}) {
+  const fields = profile.fields || {};
+  const result = {};
+  for (const definition of PROFILE_FIELD_DEFINITIONS) {
+    const value = normalizeProfileFieldValue(fields[definition.key]?.value, definition.valueKind);
+    result[definition.rawKey] = isEmptyProfileValue(value)
+      ? (definition.valueKind === "array" ? [] : null)
+      : value;
+  }
+  result.raw_evidence = Array.isArray(profile.rawProfile?.raw_evidence) ? profile.rawProfile.raw_evidence : [];
+  result.missing_fields = Array.isArray(profile.missingFieldKeys) ? profile.missingFieldKeys : [];
+  return result;
+}
+
+export function normalizeMissingProfileFieldKeys(missingFields = []) {
+  const keys = [];
+  for (const value of Array.isArray(missingFields) ? missingFields : []) {
+    const key = RAW_PROFILE_FIELD_TO_CANONICAL.get(value) || (PROFILE_FIELD_KEYS.has(value) ? value : null);
+    if (key && !keys.includes(key)) keys.push(key);
+  }
+  return keys;
+}
+
+export function normalizeProfileFieldValue(value, valueKind = "text") {
+  if (valueKind === "array") {
+    if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+    if (value === null || value === undefined || value === "") return [];
+    return String(value)
+      .split(/\n|,/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
+
+export function isEmptyProfileValue(value) {
+  return Array.isArray(value) ? value.length === 0 : String(value || "").trim() === "";
 }
 
 export function normalizeRawScore(rawScore = {}) {
@@ -77,4 +128,3 @@ function clampNumber(value, min, max) {
   if (!Number.isFinite(number)) return min;
   return Math.min(max, Math.max(min, number));
 }
-
