@@ -1,4 +1,4 @@
-export const PLAN_VERSION = "0.6.0";
+export const PLAN_VERSION = "0.7.0";
 export const SCHEMA_VERSION = 1;
 
 export const STORAGE_KEYS = Object.freeze({

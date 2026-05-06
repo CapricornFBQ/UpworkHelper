@@ -43,7 +43,7 @@ for (const file of jsFiles) {
 assert.equal(SCHEMA_VERSION, 1);
 assert.equal(DEFAULT_SETTINGS.captureMode, "strict_upwork");
 assert.equal(PLATFORM_HOSTS.upwork, "www.upwork.com");
-assert.equal(PLAN_VERSION, "0.6.0");
+assert.equal(PLAN_VERSION, "0.7.0");
 assert.equal(OPPORTUNITY_STATUS.draft, "draft");
 assert.equal(OPPORTUNITY_STATUS.captured, "captured");
 assert.equal(OUTCOME_STATUS.applied, "applied");
@@ -238,7 +238,7 @@ assert.equal(missingReferencePreview.ok, false);
 assert.match(missingReferencePreview.error, /references missing opportunity/);
 
 const unsupportedFutureEntity = structuredClone(validImportPayload);
-unsupportedFutureEntity.data[STORAGE_KEYS.clientRecords] = [{ id: "client_1" }];
+unsupportedFutureEntity.data[STORAGE_KEYS.fieldSelectors] = [{ id: "selector_1" }];
 const unsupportedFutureEntityPreview = await sendBackgroundMessage({ type: "data:importPreview", data: unsupportedFutureEntity });
 assert.equal(unsupportedFutureEntityPreview.ok, false);
 assert.match(unsupportedFutureEntityPreview.error, /import is not supported yet/);
@@ -286,9 +286,10 @@ await runProfileReviewTests();
 await runPersonalContextScoreTests();
 await runProposalDraftTests();
 await runOutcomeEventTests();
+await runClientRecordTests();
 await runScoreTests();
 
-console.log("v0.6 validation passed");
+console.log("v0.7 validation passed");
 
 async function runSettingsExportBackupTests() {
   const harness = await loadBackgroundForValidation({
@@ -503,13 +504,15 @@ async function runArchiveRestoreDeleteTests() {
           currentProfileId: "profile_delete",
           currentScoreResultId: "score_delete",
           currentNotesRevisionId: "note_delete",
-          currentProposalDraftId: "proposal_delete"
+          currentProposalDraftId: "proposal_delete",
+          clientRecordId: "client_delete"
         }),
         makeOpportunity("opp_keep", {
           snapshotIds: ["snap_keep"],
           currentProfileId: "profile_keep",
           currentScoreResultId: "score_keep",
-          currentNotesRevisionId: "note_keep"
+          currentNotesRevisionId: "note_keep",
+          clientRecordId: "client_keep"
         })
       ],
       [STORAGE_KEYS.snapshots]: [
@@ -535,6 +538,10 @@ async function runArchiveRestoreDeleteTests() {
       [STORAGE_KEYS.outcomeEvents]: [
         makeOutcomeEvent("outcome_delete", "opp_delete", { eventType: OUTCOME_EVENT_TYPE.proposalSent }),
         makeOutcomeEvent("outcome_keep", "opp_keep", { eventType: OUTCOME_EVENT_TYPE.proposalSent })
+      ],
+      [STORAGE_KEYS.clientRecords]: [
+        makeClientRecord("client_delete", { identitySources: [{ source: "manual", value: "delete", opportunityId: "opp_delete", snapshotId: null, createdAt: "2026-05-06T00:00:00.000Z" }] }),
+        makeClientRecord("client_keep", { identitySources: [{ source: "manual", value: "keep", opportunityId: "opp_keep", snapshotId: null, createdAt: "2026-05-06T00:00:00.000Z" }] })
       ]
     }
   });
@@ -557,10 +564,13 @@ async function runArchiveRestoreDeleteTests() {
   assert.equal(harness.storageData[STORAGE_KEYS.noteRevisions].some((item) => item.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.proposalDrafts].some((item) => item.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.outcomeEvents].some((item) => item.opportunityId === "opp_delete"), false);
+  assert.equal(harness.storageData[STORAGE_KEYS.clientRecords].some((item) => item.id === "client_delete"), true);
+  assert.equal(harness.storageData[STORAGE_KEYS.clientRecords].find((item) => item.id === "client_delete").identitySources.some((source) => source.opportunityId === "opp_delete"), false);
   assert.equal(harness.storageData[STORAGE_KEYS.opportunities].some((item) => item.id === "opp_keep"), true);
   assert.equal(harness.storageData[STORAGE_KEYS.snapshots].some((item) => item.opportunityId === "opp_keep"), true);
   assert.equal(harness.storageData[STORAGE_KEYS.proposalDrafts].some((item) => item.opportunityId === "opp_keep"), true);
   assert.equal(harness.storageData[STORAGE_KEYS.outcomeEvents].some((item) => item.opportunityId === "opp_keep"), true);
+  assert.equal(harness.storageData[STORAGE_KEYS.clientRecords].find((item) => item.id === "client_keep").identitySources.some((source) => source.opportunityId === "opp_keep"), true);
 }
 
 async function runNotesStaleTests() {
@@ -1091,6 +1101,155 @@ async function runOutcomeEventTests() {
   assert.match(badOutcomePreview.error, /missing ProposalDraft/);
 }
 
+async function runClientRecordTests() {
+  const harness = await loadBackgroundForValidation({
+    storageData: {
+      [STORAGE_KEYS.opportunities]: [
+        makeOpportunity("opp_client_a", { currentScoreResultId: "score_client_a" }),
+        makeOpportunity("opp_client_b", { currentScoreResultId: "score_client_b" }),
+        makeOpportunity("opp_client_c", { currentScoreResultId: "score_client_c" })
+      ],
+      [STORAGE_KEYS.scoreResults]: [
+        makeScore("score_client_a", "opp_client_a", { totalScore: 80 }),
+        makeScore("score_client_b", "opp_client_b", { totalScore: 90 }),
+        makeScore("score_client_c", "opp_client_c", { totalScore: 70 })
+      ],
+      [STORAGE_KEYS.outcomeEvents]: [
+        makeOutcomeEvent("outcome_client_a", "opp_client_a", { eventType: OUTCOME_EVENT_TYPE.proposalSent }),
+        makeOutcomeEvent("outcome_client_b", "opp_client_b", { eventType: OUTCOME_EVENT_TYPE.clientReplied })
+      ]
+    }
+  });
+
+  const created = await harness({
+    type: "clients:create",
+    opportunityId: "opp_client_a",
+    clientRecord: {
+      displayName: "Acme Client",
+      primaryClientKey: "manual:acme",
+      notes: "Good communicator",
+      redFlags: ["slow feedback"]
+    }
+  });
+  assert.equal(created.ok, true);
+  const acmeId = created.clientRecord.id;
+  assert.equal(created.clientRecord.summary.seenCount, 1);
+  assert.equal(harness.storageData[STORAGE_KEYS.opportunities].find((item) => item.id === "opp_client_a").clientRecordId, acmeId);
+
+  const duplicate = await harness({
+    type: "clients:create",
+    clientRecord: { displayName: "Duplicate Acme", primaryClientKey: "manual:acme" }
+  });
+  assert.equal(duplicate.ok, false);
+  assert.match(duplicate.error, /already exists/);
+
+  const updated = await harness({
+    type: "clients:update",
+    id: acmeId,
+    clientRecord: {
+      displayName: "Acme Client LLC",
+      notes: "Pays on time",
+      redFlags: ["scope drift"]
+    }
+  });
+  assert.equal(updated.ok, true);
+  assert.equal(updated.clientRecord.displayName, "Acme Client LLC");
+  assert.deepEqual(updated.clientRecord.redFlags, ["scope drift"]);
+
+  const linked = await harness({ type: "clients:linkOpportunity", id: acmeId, opportunityId: "opp_client_b" });
+  assert.equal(linked.ok, true);
+  assert.equal(linked.opportunity.clientRecord.summary.seenCount, 2);
+  assert.equal(linked.opportunity.clientRecord.summary.averageScore, 85);
+  assert.equal(linked.opportunity.clientRecord.summary.previousOutcomes.length, 2);
+
+  const listed = await harness({ type: "clients:list" });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.clientRecords.length, 1);
+  assert.equal(listed.clientRecords[0].summary.seenCount, 2);
+
+  const fetched = await harness({ type: "clients:get", id: acmeId });
+  assert.equal(fetched.ok, true);
+  assert.equal(fetched.clientRecord.summary.opportunityIds.includes("opp_client_b"), true);
+
+  const second = await harness({
+    type: "clients:create",
+    opportunityId: "opp_client_c",
+    clientRecord: {
+      displayName: "Beta Client",
+      primaryClientKey: "manual:beta"
+    }
+  });
+  assert.equal(second.ok, true);
+  const betaId = second.clientRecord.id;
+
+  const merged = await harness({ type: "clients:merge", sourceId: betaId, targetId: acmeId });
+  assert.equal(merged.ok, true);
+  assert.equal(merged.clientRecord.summary.seenCount, 3);
+  assert.equal(harness.storageData[STORAGE_KEYS.clientRecords].find((item) => item.id === betaId).archivedAt !== null, true);
+  assert.equal(harness.storageData[STORAGE_KEYS.opportunities].find((item) => item.id === "opp_client_c").clientRecordId, acmeId);
+
+  const split = await harness({
+    type: "clients:split",
+    sourceId: acmeId,
+    opportunityIds: ["opp_client_c"],
+    clientRecord: {
+      displayName: "Beta Client split",
+      primaryClientKey: "manual:beta-split"
+    }
+  });
+  assert.equal(split.ok, true);
+  const splitId = split.clientRecord.id;
+  assert.equal(harness.storageData[STORAGE_KEYS.opportunities].find((item) => item.id === "opp_client_c").clientRecordId, splitId);
+  assert.equal(harness.storageData[STORAGE_KEYS.clientRecords].find((item) => item.id === acmeId).splitHistory.length > 0, true);
+
+  const unlinked = await harness({ type: "clients:unlinkOpportunity", opportunityId: "opp_client_c" });
+  assert.equal(unlinked.ok, true);
+  assert.equal(unlinked.opportunity.clientRecordId, null);
+
+  const archived = await harness({ type: "clients:archive", id: acmeId });
+  assert.equal(archived.ok, true);
+  assert.equal(archived.clientRecord.archivedAt !== null, true);
+  assert.equal(harness.storageData[STORAGE_KEYS.opportunities].find((item) => item.id === "opp_client_a").clientRecordId, null);
+  assert.equal(harness.storageData[STORAGE_KEYS.opportunities].find((item) => item.id === "opp_client_b").clientRecordId, null);
+
+  const clientImport = structuredClone(validImportPayload);
+  clientImport.data[STORAGE_KEYS.opportunities] = [makeOpportunity("opp_import_client", { clientRecordId: "client_import" })];
+  clientImport.data[STORAGE_KEYS.clientRecords] = [makeClientRecord("client_import", {
+    primaryClientKey: "manual:import",
+    identitySources: [{
+      source: "manual",
+      value: "manual:import",
+      label: "Imported client",
+      opportunityId: "opp_import_client",
+      snapshotId: null,
+      createdAt: "2026-05-06T00:00:00.000Z"
+    }]
+  })];
+  const clientImportPreview = await sendBackgroundMessage({ type: "data:importPreview", data: clientImport });
+  assert.equal(clientImportPreview.ok, true);
+  assert.equal(clientImportPreview.preview.entityCounts.clientRecords, 1);
+
+  const missingClientImport = structuredClone(clientImport);
+  missingClientImport.data[STORAGE_KEYS.opportunities][0].clientRecordId = "missing_client";
+  const missingClientPreview = await sendBackgroundMessage({ type: "data:importPreview", data: missingClientImport });
+  assert.equal(missingClientPreview.ok, false);
+  assert.match(missingClientPreview.error, /missing ClientRecord/);
+
+  const missingClientSourceImport = structuredClone(clientImport);
+  missingClientSourceImport.data[STORAGE_KEYS.clientRecords][0].identitySources[0].opportunityId = "missing_opp";
+  const missingClientSourcePreview = await sendBackgroundMessage({ type: "data:importPreview", data: missingClientSourceImport });
+  assert.equal(missingClientSourcePreview.ok, false);
+  assert.match(missingClientSourcePreview.error, /references missing opportunity/);
+
+  const duplicateClientImport = structuredClone(clientImport);
+  duplicateClientImport.data[STORAGE_KEYS.clientRecords].push(makeClientRecord("client_import_duplicate", {
+    primaryClientKey: "manual:import"
+  }));
+  const duplicateClientPreview = await sendBackgroundMessage({ type: "data:importPreview", data: duplicateClientImport });
+  assert.equal(duplicateClientPreview.ok, false);
+  assert.match(duplicateClientPreview.error, /duplicates active primaryClientKey/);
+}
+
 async function runScoreTests() {
   let harness = await loadBackgroundForValidation({
     storageData: {
@@ -1536,6 +1695,25 @@ function makeOutcomeEvent(id = "outcome_event", opportunityId = "opp_extension",
     notes: "Outcome note",
     correctionOfEventId: null,
     voidedAt: null,
+    ...overrides
+  };
+}
+
+function makeClientRecord(id = "client_record", overrides = {}) {
+  const now = "2026-05-06T00:00:00.000Z";
+  return {
+    id,
+    schemaVersion: SCHEMA_VERSION,
+    createdAt: now,
+    updatedAt: now,
+    primaryClientKey: `manual:${id}`,
+    identitySources: [],
+    displayName: `Client ${id}`,
+    notes: "",
+    redFlags: [],
+    mergeHistory: [],
+    splitHistory: [],
+    archivedAt: null,
     ...overrides
   };
 }

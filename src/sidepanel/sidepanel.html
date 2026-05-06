@@ -42,6 +42,57 @@
       <section id="summaryPanel" class="panel"></section>
 
       <section class="panel">
+        <div class="section-header">
+          <h2>Client history</h2>
+          <span id="clientBadge" class="badge">Unlinked</span>
+        </div>
+        <div id="clientSummaryPanel" class="details empty">No client record.</div>
+        <div class="grid-2">
+          <label for="clientRecordSelect">
+            Existing client
+            <select id="clientRecordSelect"></select>
+          </label>
+          <label for="clientPrimaryKey">
+            Identity key
+            <input id="clientPrimaryKey" type="text" placeholder="manual key or stable client id">
+          </label>
+        </div>
+        <label for="clientDisplayName" class="compact-label">
+          Client name
+          <input id="clientDisplayName" type="text" placeholder="Client or company name">
+        </label>
+        <label for="clientNotes" class="proposal-output-label">
+          Client notes
+          <textarea id="clientNotes" rows="3" placeholder="Relationship notes, preferences, or context..."></textarea>
+        </label>
+        <label for="clientRedFlags" class="proposal-output-label">
+          Red flags
+          <textarea id="clientRedFlags" rows="3" placeholder="One red flag per line..."></textarea>
+        </label>
+        <div class="button-row">
+          <button id="saveClientButton" class="primary">Save client</button>
+          <button id="linkClientButton">Link selected</button>
+          <button id="unlinkClientButton">Unlink</button>
+          <button id="splitClientButton">Split current</button>
+          <button id="archiveClientButton" class="danger">Archive client</button>
+        </div>
+        <div class="grid-2 compact-label">
+          <label for="clientMergeSourceSelect">
+            Merge source
+            <select id="clientMergeSourceSelect"></select>
+          </label>
+          <label for="clientMergeTargetSelect">
+            Merge target
+            <select id="clientMergeTargetSelect"></select>
+          </label>
+        </div>
+        <div class="button-row">
+          <button id="mergeClientButton">Merge clients</button>
+        </div>
+        <div id="clientHistoryPanel" class="list empty">No client history.</div>
+      </section>
+
+      <section class="panel">
         <label for="notesInput">Your notes</label>
         <textarea id="notesInput" rows="5" placeholder="Add fit, rate, strategy, or constraints..."></textarea>
         <div class="button-row">

@@ -33,9 +33,9 @@ const PROPOSAL_SOURCE_TYPES = Object.freeze(["opportunity_field", "snapshot_evid
 const OUTCOME_EVENT_TYPES = Object.freeze(Object.values(OUTCOME_EVENT_TYPE));
 const OUTCOME_STATUSES = Object.freeze(Object.values(OUTCOME_STATUS));
 const OUTCOME_EVENT_SOURCES = Object.freeze(["manual", "capture", "import"]);
+const CLIENT_IDENTITY_SOURCE_TYPES = Object.freeze(["manual", "exact", "import", "merge", "split"]);
 const MANAGED_STORAGE_KEYS = Object.freeze(Object.values(STORAGE_KEYS));
 const UNIMPLEMENTED_IMPORT_KEYS = Object.freeze([
-  STORAGE_KEYS.clientRecords,
   STORAGE_KEYS.fieldSelectors,
   STORAGE_KEYS.analyticsCache
 ]);
@@ -156,6 +156,25 @@ async function handleMessage(message) {
       return { ok: true, outcomeEvents: await listOutcomeEvents(message.opportunityId, { includeVoided: Boolean(message.includeVoided) }) };
     case "outcome:getSummary":
       return { ok: true, outcomeSummary: await getOutcomeSummary(message.opportunityId) };
+    case "clients:list":
+      return { ok: true, clientRecords: await listClientRecords({ includeArchived: Boolean(message.includeArchived) }) };
+    case "clients:get":
+      return { ok: true, clientRecord: await getClientRecord(message.id) };
+    case "clients:create":
+      return { ok: true, clientRecord: await createClientRecord(message.clientRecord || message.client || {}, message.opportunityId || null) };
+    case "clients:update":
+      return { ok: true, clientRecord: await updateClientRecord(message.id, message.clientRecord || message.client || {}) };
+    case "clients:archive":
+    case "clients:delete":
+      return { ok: true, clientRecord: await archiveClientRecord(message.id) };
+    case "clients:linkOpportunity":
+      return { ok: true, opportunity: await linkOpportunityToClient(message.opportunityId, message.id || message.clientRecordId) };
+    case "clients:unlinkOpportunity":
+      return { ok: true, opportunity: await unlinkOpportunityFromClient(message.opportunityId) };
+    case "clients:merge":
+      return { ok: true, clientRecord: await mergeClientRecords(message.sourceId || message.sourceClientRecordId, message.targetId || message.targetClientRecordId) };
+    case "clients:split":
+      return { ok: true, clientRecord: await splitClientRecord(message.sourceId || message.sourceClientRecordId, message.opportunityIds || [], message.clientRecord || message.client || {}) };
     default:
       throw new Error(`Unknown message type: ${message?.type || "empty"}`);
   }
@@ -720,6 +739,9 @@ async function listOpportunitySummaries({ includeArchived = false } = {}) {
     .map((opportunity) => {
       const score = store.scoreResults.find((item) => item.id === opportunity.currentScoreResultId) || null;
       const outcomeSummary = deriveOutcomeSummary(opportunity.id, store.outcomeEvents);
+      const clientRecord = opportunity.clientRecordId
+        ? store.clientRecords.find((item) => item.id === opportunity.clientRecordId) || null
+        : null;
       return {
         id: opportunity.id,
         schemaVersion: opportunity.schemaVersion,
@@ -728,6 +750,8 @@ async function listOpportunitySummaries({ includeArchived = false } = {}) {
         jobKey: opportunity.jobKey,
         platform: opportunity.platform,
         status: opportunity.status,
+        clientRecordId: opportunity.clientRecordId || null,
+        clientRecord: clientRecord ? toClientListItem(clientRecord, store) : null,
         updatedAt: opportunity.updatedAt,
         archivedAt: opportunity.archivedAt,
         snapshotCount: opportunity.snapshotIds.length,
@@ -799,6 +823,10 @@ async function deleteOpportunityPermanent(id) {
     store.noteRevisions = store.noteRevisions.filter((item) => item.opportunityId !== id);
     store.proposalDrafts = store.proposalDrafts.filter((item) => item.opportunityId !== id);
     store.outcomeEvents = store.outcomeEvents.filter((item) => item.opportunityId !== id);
+    store.clientRecords = store.clientRecords.map((client) => ({
+      ...client,
+      identitySources: (client.identitySources || []).filter((source) => source.opportunityId !== id)
+    }));
     await writeStore(store);
   });
 }
@@ -1621,6 +1649,396 @@ async function getOutcomeSummary(opportunityId) {
   return deriveOutcomeSummary(opportunityId, store.outcomeEvents);
 }
 
+async function listClientRecords({ includeArchived = false } = {}) {
+  const store = await readStore();
+  return (store.clientRecords || [])
+    .filter((item) => includeArchived || !item.archivedAt)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt))
+    .map((item) => toClientListItem(item, store));
+}
+
+async function getClientRecord(id) {
+  if (!id) return null;
+  const store = await readStore();
+  const clientRecord = store.clientRecords.find((item) => item.id === id);
+  return clientRecord ? toClientViewModel(clientRecord, store) : null;
+}
+
+async function createClientRecord(input = {}, opportunityId = null) {
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const now = new Date().toISOString();
+    const clientRecord = normalizeClientRecordInput(input, { now });
+    ensureUniqueClientKey(store.clientRecords, clientRecord);
+    store.clientRecords.push(clientRecord);
+    if (opportunityId) linkOpportunityRecordInStore(store, opportunityId, clientRecord.id, now);
+    appendClientIdentitySource(clientRecord, buildClientIdentitySource(clientRecord, { opportunityId, now }));
+    await writeStore(store);
+    return toClientViewModel(clientRecord, store);
+  });
+}
+
+async function updateClientRecord(id, input = {}) {
+  if (!id) throw new Error("ClientRecord id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.clientRecords.findIndex((item) => item.id === id);
+    if (index === -1) throw new Error("ClientRecord not found");
+    const current = store.clientRecords[index];
+    if (current.archivedAt) throw new Error("Archived ClientRecord cannot be updated");
+    const updated = normalizeClientRecordInput(input, { current, now: new Date().toISOString() });
+    ensureUniqueClientKey(store.clientRecords, updated);
+    store.clientRecords[index] = updated;
+    await writeStore(store);
+    return toClientViewModel(updated, store);
+  });
+}
+
+async function archiveClientRecord(id) {
+  if (!id) throw new Error("ClientRecord id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const index = store.clientRecords.findIndex((item) => item.id === id);
+    if (index === -1) throw new Error("ClientRecord not found");
+    const current = store.clientRecords[index];
+    if (current.archivedAt) return toClientViewModel(current, store);
+    const now = new Date().toISOString();
+    const opportunityIds = [];
+    for (const opportunity of store.opportunities) {
+      if (opportunity.clientRecordId !== id) continue;
+      opportunity.clientRecordId = null;
+      opportunity.updatedAt = now;
+      opportunityIds.push(opportunity.id);
+    }
+    store.clientRecords[index] = {
+      ...current,
+      updatedAt: now,
+      archivedAt: now,
+      splitHistory: [
+        ...(current.splitHistory || []),
+        {
+          id: crypto.randomUUID(),
+          action: "archive_unlink",
+          opportunityIds,
+          createdAt: now
+        }
+      ]
+    };
+    await writeStore(store);
+    return toClientViewModel(store.clientRecords[index], store);
+  });
+}
+
+async function linkOpportunityToClient(opportunityId, clientRecordId) {
+  if (!opportunityId) throw new Error("Opportunity id is required");
+  if (!clientRecordId) throw new Error("ClientRecord id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const now = new Date().toISOString();
+    const opportunity = linkOpportunityRecordInStore(store, opportunityId, clientRecordId, now);
+    await writeStore(store);
+    return hydrateOpportunity(opportunity, store);
+  });
+}
+
+async function unlinkOpportunityFromClient(opportunityId) {
+  if (!opportunityId) throw new Error("Opportunity id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const opportunity = store.opportunities.find((item) => item.id === opportunityId);
+    if (!opportunity) throw new Error("Opportunity not found");
+    const oldClientId = opportunity.clientRecordId;
+    if (!oldClientId) return hydrateOpportunity(opportunity, store);
+    const now = new Date().toISOString();
+    opportunity.clientRecordId = null;
+    opportunity.updatedAt = now;
+    const clientRecord = store.clientRecords.find((item) => item.id === oldClientId);
+    if (clientRecord) {
+      clientRecord.updatedAt = now;
+      clientRecord.splitHistory = [
+        ...(clientRecord.splitHistory || []),
+        {
+          id: crypto.randomUUID(),
+          action: "manual_unlink",
+          opportunityIds: [opportunityId],
+          createdAt: now
+        }
+      ];
+    }
+    await writeStore(store);
+    return hydrateOpportunity(opportunity, store);
+  });
+}
+
+async function mergeClientRecords(sourceId, targetId) {
+  if (!sourceId || !targetId) throw new Error("Source and target ClientRecord ids are required");
+  if (sourceId === targetId) throw new Error("Cannot merge a ClientRecord into itself");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const source = store.clientRecords.find((item) => item.id === sourceId);
+    const target = store.clientRecords.find((item) => item.id === targetId);
+    if (!source || !target) throw new Error("ClientRecord not found");
+    if (source.archivedAt || target.archivedAt) throw new Error("Archived ClientRecord cannot be merged");
+    const now = new Date().toISOString();
+    const movedOpportunityIds = [];
+    for (const opportunity of store.opportunities) {
+      if (opportunity.clientRecordId !== sourceId) continue;
+      opportunity.clientRecordId = targetId;
+      opportunity.updatedAt = now;
+      movedOpportunityIds.push(opportunity.id);
+    }
+    target.updatedAt = now;
+    target.identitySources = mergeClientIdentitySources(target.identitySources, source.identitySources);
+    appendClientIdentitySource(target, {
+      source: "merge",
+      value: source.primaryClientKey,
+      label: source.displayName,
+      opportunityId: null,
+      snapshotId: null,
+      createdAt: now
+    });
+    target.mergeHistory = [
+      ...(target.mergeHistory || []),
+      {
+        id: crypto.randomUUID(),
+        sourceClientRecordId: source.id,
+        sourceDisplayName: source.displayName,
+        sourcePrimaryClientKey: source.primaryClientKey,
+        opportunityIds: movedOpportunityIds,
+        createdAt: now
+      }
+    ];
+    source.updatedAt = now;
+    source.archivedAt = now;
+    source.mergeHistory = [
+      ...(source.mergeHistory || []),
+      {
+        id: crypto.randomUUID(),
+        targetClientRecordId: target.id,
+        targetDisplayName: target.displayName,
+        opportunityIds: movedOpportunityIds,
+        createdAt: now
+      }
+    ];
+    await writeStore(store);
+    return toClientViewModel(target, store);
+  });
+}
+
+async function splitClientRecord(sourceId, opportunityIds = [], input = {}) {
+  if (!sourceId) throw new Error("Source ClientRecord id is required");
+  const selectedOpportunityIds = [...new Set((Array.isArray(opportunityIds) ? opportunityIds : []).map((id) => normalizeText(id)).filter(Boolean))];
+  if (!selectedOpportunityIds.length) throw new Error("At least one opportunity id is required");
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const source = store.clientRecords.find((item) => item.id === sourceId);
+    if (!source) throw new Error("ClientRecord not found");
+    if (source.archivedAt) throw new Error("Archived ClientRecord cannot be split");
+    const opportunitiesToMove = selectedOpportunityIds.map((id) => {
+      const opportunity = store.opportunities.find((item) => item.id === id);
+      if (!opportunity) throw new Error(`Opportunity ${id} not found`);
+      if (opportunity.clientRecordId !== sourceId) throw new Error(`Opportunity ${id} is not linked to the source ClientRecord`);
+      return opportunity;
+    });
+    const now = new Date().toISOString();
+    const newClientRecord = normalizeClientRecordInput(input, { now });
+    ensureUniqueClientKey(store.clientRecords, newClientRecord);
+    store.clientRecords.push(newClientRecord);
+    for (const opportunity of opportunitiesToMove) {
+      opportunity.clientRecordId = newClientRecord.id;
+      opportunity.updatedAt = now;
+      appendClientIdentitySource(newClientRecord, buildClientIdentitySource(newClientRecord, { opportunityId: opportunity.id, now }));
+    }
+    source.updatedAt = now;
+    source.splitHistory = [
+      ...(source.splitHistory || []),
+      {
+        id: crypto.randomUUID(),
+        newClientRecordId: newClientRecord.id,
+        opportunityIds: selectedOpportunityIds,
+        createdAt: now
+      }
+    ];
+    newClientRecord.splitHistory = [
+      ...(newClientRecord.splitHistory || []),
+      {
+        id: crypto.randomUUID(),
+        sourceClientRecordId: source.id,
+        opportunityIds: selectedOpportunityIds,
+        createdAt: now
+      }
+    ];
+    await writeStore(store);
+    return toClientViewModel(newClientRecord, store);
+  });
+}
+
+function linkOpportunityRecordInStore(store, opportunityId, clientRecordId, now) {
+  const opportunity = store.opportunities.find((item) => item.id === opportunityId);
+  if (!opportunity) throw new Error("Opportunity not found");
+  const clientRecord = store.clientRecords.find((item) => item.id === clientRecordId);
+  if (!clientRecord) throw new Error("ClientRecord not found");
+  if (clientRecord.archivedAt) throw new Error("Archived ClientRecord cannot be linked");
+  opportunity.clientRecordId = clientRecordId;
+  opportunity.updatedAt = now;
+  clientRecord.updatedAt = now;
+  appendClientIdentitySource(clientRecord, buildClientIdentitySource(clientRecord, { opportunityId, now }));
+  return opportunity;
+}
+
+function normalizeClientRecordInput(input = {}, { current = null, now } = {}) {
+  const id = normalizeText(current?.id || input.id) || crypto.randomUUID();
+  const displayName = normalizeText(input.displayName ?? input.display_name ?? current?.displayName);
+  if (!displayName) throw new Error("Client displayName is required");
+  const primaryClientKey = normalizeText(input.primaryClientKey ?? input.primary_client_key ?? current?.primaryClientKey) || `manual:${id}`;
+  return {
+    id,
+    schemaVersion: SCHEMA_VERSION,
+    createdAt: current?.createdAt || normalizeOptionalIsoTime(input.createdAt || input.created_at) || now,
+    updatedAt: now,
+    primaryClientKey,
+    identitySources: normalizeClientIdentitySources(input.identitySources ?? input.identity_sources ?? current?.identitySources ?? [], now),
+    displayName,
+    notes: normalizeText(input.notes ?? current?.notes),
+    redFlags: normalizeStringList(input.redFlags ?? input.red_flags ?? current?.redFlags),
+    mergeHistory: Array.isArray(current?.mergeHistory) ? current.mergeHistory : normalizeClientHistory(input.mergeHistory ?? input.merge_history),
+    splitHistory: Array.isArray(current?.splitHistory) ? current.splitHistory : normalizeClientHistory(input.splitHistory ?? input.split_history),
+    archivedAt: current?.archivedAt || null
+  };
+}
+
+function normalizeClientIdentitySources(value, now) {
+  const items = Array.isArray(value) ? value : [];
+  return items.map((item) => {
+    const source = normalizeText(item?.source || "manual");
+    return {
+      source: CLIENT_IDENTITY_SOURCE_TYPES.includes(source) ? source : "manual",
+      value: normalizeText(item?.value ?? item?.primaryClientKey ?? item?.primary_client_key),
+      label: normalizeText(item?.label ?? item?.displayName ?? item?.display_name),
+      opportunityId: normalizeText(item?.opportunityId ?? item?.opportunity_id) || null,
+      snapshotId: normalizeText(item?.snapshotId ?? item?.snapshot_id) || null,
+      createdAt: normalizeOptionalIsoTime(item?.createdAt ?? item?.created_at) || now
+    };
+  }).filter((item) => item.value || item.label || item.opportunityId || item.snapshotId);
+}
+
+function normalizeClientHistory(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeOptionalIsoTime(value) {
+  const text = normalizeText(value);
+  if (!text) return null;
+  const time = Date.parse(text);
+  if (Number.isNaN(time)) throw new Error("ClientRecord date field must be a valid ISO date");
+  return new Date(time).toISOString();
+}
+
+function ensureUniqueClientKey(clientRecords, candidate) {
+  const key = normalizeText(candidate.primaryClientKey);
+  if (!key) throw new Error("Client primaryClientKey is required");
+  const duplicate = (clientRecords || []).find((item) => item.id !== candidate.id && item.primaryClientKey === key && !item.archivedAt);
+  if (duplicate) throw new Error("Client primaryClientKey already exists");
+}
+
+function buildClientIdentitySource(clientRecord, { opportunityId = null, now }) {
+  return {
+    source: "manual",
+    value: clientRecord.primaryClientKey,
+    label: clientRecord.displayName,
+    opportunityId,
+    snapshotId: null,
+    createdAt: now
+  };
+}
+
+function appendClientIdentitySource(clientRecord, source) {
+  const sources = Array.isArray(clientRecord.identitySources) ? clientRecord.identitySources : [];
+  const key = clientIdentitySourceKey(source);
+  if (!sources.some((item) => clientIdentitySourceKey(item) === key)) sources.push(source);
+  clientRecord.identitySources = sources;
+}
+
+function mergeClientIdentitySources(left = [], right = []) {
+  const merged = [];
+  for (const source of [...(left || []), ...(right || [])]) {
+    if (!source) continue;
+    const key = clientIdentitySourceKey(source);
+    if (!merged.some((item) => clientIdentitySourceKey(item) === key)) merged.push(source);
+  }
+  return merged;
+}
+
+function clientIdentitySourceKey(source = {}) {
+  return [
+    source.source || "",
+    source.value || "",
+    source.opportunityId || "",
+    source.snapshotId || ""
+  ].join("|");
+}
+
+function toClientListItem(clientRecord, store) {
+  return {
+    id: clientRecord.id,
+    schemaVersion: clientRecord.schemaVersion,
+    displayName: clientRecord.displayName,
+    primaryClientKey: clientRecord.primaryClientKey,
+    updatedAt: clientRecord.updatedAt,
+    archivedAt: clientRecord.archivedAt || null,
+    summary: deriveClientSummary(clientRecord.id, store)
+  };
+}
+
+function toClientViewModel(clientRecord, store) {
+  return {
+    ...clientRecord,
+    summary: deriveClientSummary(clientRecord.id, store)
+  };
+}
+
+function deriveClientSummary(clientRecordId, store) {
+  const linkedOpportunities = (store.opportunities || [])
+    .filter((item) => item.clientRecordId === clientRecordId)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
+  const scoreValues = linkedOpportunities
+    .map((opportunity) => store.scoreResults.find((score) => score.id === opportunity.currentScoreResultId)?.totalScore)
+    .filter((score) => Number.isFinite(score));
+  const previousOutcomes = linkedOpportunities
+    .map((opportunity) => {
+      const outcomeSummary = deriveOutcomeSummary(opportunity.id, store.outcomeEvents);
+      return {
+        opportunityId: opportunity.id,
+        title: opportunity.title,
+        status: outcomeSummary.status,
+        updatedAt: outcomeSummary.updatedAt
+      };
+    })
+    .filter((item) => item.status !== OUTCOME_STATUS.notApplied);
+  return {
+    clientRecordId,
+    seenCount: linkedOpportunities.length,
+    averageScore: scoreValues.length
+      ? Math.round((scoreValues.reduce((sum, score) => sum + score, 0) / scoreValues.length) * 10) / 10
+      : null,
+    opportunityIds: linkedOpportunities.map((item) => item.id),
+    opportunities: linkedOpportunities.map((opportunity) => {
+      const score = store.scoreResults.find((item) => item.id === opportunity.currentScoreResultId) || null;
+      const outcomeSummary = deriveOutcomeSummary(opportunity.id, store.outcomeEvents);
+      return {
+        id: opportunity.id,
+        title: opportunity.title,
+        status: opportunity.status,
+        archivedAt: opportunity.archivedAt || null,
+        totalScore: score?.totalScore ?? null,
+        outcomeStatus: outcomeSummary.status,
+        updatedAt: opportunity.updatedAt
+      };
+    }),
+    previousOutcomes
+  };
+}
+
 function normalizeOutcomeEventInput(input, { opportunity, proposalDrafts, outcomeEvents }) {
   const now = new Date().toISOString();
   const eventType = normalizeText(input.eventType || input.event_type);
@@ -2241,6 +2659,9 @@ function hydrateOpportunity(opportunity, store) {
   const proposalDraft = store.proposalDrafts.find((item) => item.id === opportunity.currentProposalDraftId) || null;
   const outcomeEvents = getOutcomeEventsForOpportunity(opportunity.id, store.outcomeEvents, { includeVoided: true });
   const outcomeSummary = deriveOutcomeSummary(opportunity.id, store.outcomeEvents);
+  const clientRecord = opportunity.clientRecordId
+    ? store.clientRecords.find((item) => item.id === opportunity.clientRecordId) || null
+    : null;
   const notes = getCurrentNotesText(opportunity, store.noteRevisions);
   const scoreStale = Boolean(score && (score.notesRevisionId || null) !== (opportunity.currentNotesRevisionId || null));
   const proposalStale = Boolean(proposalDraft && (
@@ -2263,6 +2684,7 @@ function hydrateOpportunity(opportunity, store) {
     proposalDraft,
     outcomeSummary,
     outcomeEvents,
+    clientRecord: clientRecord ? toClientViewModel(clientRecord, store) : null,
     snapshotCount: snapshots.length,
     currentScore: score ? {
       id: score.id,
@@ -2461,7 +2883,8 @@ async function readStore() {
     STORAGE_KEYS.scoreResults,
     STORAGE_KEYS.noteRevisions,
     STORAGE_KEYS.proposalDrafts,
-    STORAGE_KEYS.outcomeEvents
+    STORAGE_KEYS.outcomeEvents,
+    STORAGE_KEYS.clientRecords
   ]);
   return {
     meta: data[STORAGE_KEYS.meta] || null,
@@ -2471,7 +2894,8 @@ async function readStore() {
     scoreResults: data[STORAGE_KEYS.scoreResults] || [],
     noteRevisions: data[STORAGE_KEYS.noteRevisions] || [],
     proposalDrafts: data[STORAGE_KEYS.proposalDrafts] || [],
-    outcomeEvents: data[STORAGE_KEYS.outcomeEvents] || []
+    outcomeEvents: data[STORAGE_KEYS.outcomeEvents] || [],
+    clientRecords: data[STORAGE_KEYS.clientRecords] || []
   };
 }
 
@@ -2483,7 +2907,8 @@ async function writeStore(store) {
     [STORAGE_KEYS.scoreResults]: store.scoreResults,
     [STORAGE_KEYS.noteRevisions]: store.noteRevisions,
     [STORAGE_KEYS.proposalDrafts]: store.proposalDrafts || [],
-    [STORAGE_KEYS.outcomeEvents]: store.outcomeEvents || []
+    [STORAGE_KEYS.outcomeEvents]: store.outcomeEvents || [],
+    [STORAGE_KEYS.clientRecords]: store.clientRecords || []
   });
   await bumpStorageRevision();
 }
@@ -2569,6 +2994,7 @@ function validateImportData(importPayload) {
   const portfolioCases = requireArray(data[STORAGE_KEYS.portfolioCases] || [], STORAGE_KEYS.portfolioCases);
   const proposalDrafts = requireArray(data[STORAGE_KEYS.proposalDrafts] || [], STORAGE_KEYS.proposalDrafts);
   const outcomeEvents = requireArray(data[STORAGE_KEYS.outcomeEvents] || [], STORAGE_KEYS.outcomeEvents);
+  const clientRecords = requireArray(data[STORAGE_KEYS.clientRecords] || [], STORAGE_KEYS.clientRecords);
   validateEntityShape(opportunities, IMPORT_ENTITY_SCHEMAS.opportunity);
   validateEntityShape(snapshots, IMPORT_ENTITY_SCHEMAS.snapshot);
   validateEntityShape(profiles, IMPORT_ENTITY_SCHEMAS.opportunityProfile);
@@ -2578,7 +3004,8 @@ function validateImportData(importPayload) {
   validateEntityShape(portfolioCases, IMPORT_ENTITY_SCHEMAS.portfolioCase);
   validateEntityShape(proposalDrafts, IMPORT_ENTITY_SCHEMAS.proposalDraft);
   validateEntityShape(outcomeEvents, IMPORT_ENTITY_SCHEMAS.outcomeEvent);
-  validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents });
+  validateEntityShape(clientRecords, IMPORT_ENTITY_SCHEMAS.clientRecord);
+  validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents, clientRecords });
 
   return {
     schemaVersion: manifest.schemaVersion,
@@ -2591,7 +3018,8 @@ function validateImportData(importPayload) {
       myProfile: myProfile ? 1 : 0,
       portfolioCases: portfolioCases.length,
       proposalDrafts: proposalDrafts.length,
-      outcomeEvents: outcomeEvents.length
+      outcomeEvents: outcomeEvents.length,
+      clientRecords: clientRecords.length
     }
   };
 }
@@ -2641,6 +3069,11 @@ const IMPORT_ENTITY_SCHEMAS = Object.freeze({
     name: "OutcomeEvent",
     required: ["id", "opportunityId", "schemaVersion", "eventType", "occurredAt", "recordedAt", "source", "payload", "notes"],
     allowed: ["id", "opportunityId", "schemaVersion", "eventType", "occurredAt", "recordedAt", "source", "snapshotId", "payload", "notes", "correctionOfEventId", "voidedAt"]
+  },
+  clientRecord: {
+    name: "ClientRecord",
+    required: ["id", "schemaVersion", "createdAt", "updatedAt", "primaryClientKey", "identitySources", "displayName", "notes", "redFlags", "mergeHistory", "splitHistory"],
+    allowed: ["id", "schemaVersion", "createdAt", "updatedAt", "primaryClientKey", "identitySources", "displayName", "notes", "redFlags", "mergeHistory", "splitHistory", "archivedAt"]
   }
 });
 
@@ -2747,7 +3180,7 @@ function requireArray(value, name) {
   return value;
 }
 
-function validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents }) {
+function validateReferences({ opportunities, snapshots, profiles, scores, notes, myProfile, portfolioCases, proposalDrafts, outcomeEvents, clientRecords }) {
   const opportunityIds = new Set(opportunities.map((item) => item.id));
   const snapshotIds = new Set(snapshots.map((item) => item.id));
   const profileIds = new Set(profiles.map((item) => item.id));
@@ -2756,6 +3189,8 @@ function validateReferences({ opportunities, snapshots, profiles, scores, notes,
   const portfolioCaseIds = new Set(portfolioCases.map((item) => item.id));
   const proposalDraftIds = new Set(proposalDrafts.map((item) => item.id));
   const outcomeEventIds = new Set(outcomeEvents.map((item) => item.id));
+  const clientRecordIds = new Set(clientRecords.map((item) => item.id));
+  validateClientRecordsForImport(clientRecords, { opportunityIds, snapshotIds });
   for (const opportunity of opportunities) {
     for (const snapshotId of opportunity.snapshotIds || []) {
       if (!snapshotIds.has(snapshotId)) throw new Error(`Opportunity ${opportunity.id} references missing snapshot`);
@@ -2764,6 +3199,7 @@ function validateReferences({ opportunities, snapshots, profiles, scores, notes,
     if (opportunity.currentScoreResultId && !scoreIds.has(opportunity.currentScoreResultId)) throw new Error(`Opportunity ${opportunity.id} references missing ScoreResult`);
     if (opportunity.currentNotesRevisionId && !noteIds.has(opportunity.currentNotesRevisionId)) throw new Error(`Opportunity ${opportunity.id} references missing notes revision`);
     if (opportunity.currentProposalDraftId && !proposalDraftIds.has(opportunity.currentProposalDraftId)) throw new Error(`Opportunity ${opportunity.id} references missing ProposalDraft`);
+    if (opportunity.clientRecordId && !clientRecordIds.has(opportunity.clientRecordId)) throw new Error(`Opportunity ${opportunity.id} references missing ClientRecord`);
   }
   for (const snapshot of snapshots) {
     if (!opportunityIds.has(snapshot.opportunityId)) throw new Error(`Snapshot ${snapshot.id} references missing opportunity`);
@@ -2811,6 +3247,27 @@ function validateReferences({ opportunities, snapshots, profiles, scores, notes,
     if (event.eventType === OUTCOME_EVENT_TYPE.captureDetectedStatus) {
       const detectedStatus = event.payload?.detectedStatus || event.payload?.detected_status;
       if (!OUTCOME_STATUSES.includes(detectedStatus)) throw new Error(`OutcomeEvent ${event.id} has unsupported detectedStatus`);
+    }
+  }
+}
+
+function validateClientRecordsForImport(clientRecords, { opportunityIds, snapshotIds }) {
+  const activeKeys = new Set();
+  for (const clientRecord of clientRecords) {
+    if (!normalizeText(clientRecord.displayName)) throw new Error(`ClientRecord ${clientRecord.id} missing displayName`);
+    if (!normalizeText(clientRecord.primaryClientKey)) throw new Error(`ClientRecord ${clientRecord.id} missing primaryClientKey`);
+    if (!Array.isArray(clientRecord.identitySources)) throw new Error(`ClientRecord ${clientRecord.id} identitySources must be an array`);
+    if (!Array.isArray(clientRecord.redFlags)) throw new Error(`ClientRecord ${clientRecord.id} redFlags must be an array`);
+    if (!Array.isArray(clientRecord.mergeHistory)) throw new Error(`ClientRecord ${clientRecord.id} mergeHistory must be an array`);
+    if (!Array.isArray(clientRecord.splitHistory)) throw new Error(`ClientRecord ${clientRecord.id} splitHistory must be an array`);
+    if (!clientRecord.archivedAt) {
+      if (activeKeys.has(clientRecord.primaryClientKey)) throw new Error(`ClientRecord ${clientRecord.id} duplicates active primaryClientKey`);
+      activeKeys.add(clientRecord.primaryClientKey);
+    }
+    for (const source of clientRecord.identitySources) {
+      if (!CLIENT_IDENTITY_SOURCE_TYPES.includes(source?.source)) throw new Error(`ClientRecord ${clientRecord.id} has unsupported identity source`);
+      if (source?.opportunityId && !opportunityIds.has(source.opportunityId)) throw new Error(`ClientRecord ${clientRecord.id} references missing opportunity`);
+      if (source?.snapshotId && !snapshotIds.has(source.snapshotId)) throw new Error(`ClientRecord ${clientRecord.id} references missing snapshot`);
     }
   }
 }

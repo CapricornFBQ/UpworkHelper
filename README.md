@@ -17,7 +17,7 @@ Local Chrome MV3 extension for manually capturing Upwork pages into opportunity 
 
 ## Validation
 
-- Core business handler regression: `node scripts/validate_v0_6.mjs`
+- Core business handler regression: `node scripts/validate_v0_7.mjs`
 - Unpacked extension smoke: `node scripts/smoke_unpacked_extension.mjs`
 
 The smoke script uses the first available Chromium-family browser and can be forced with `CHROME_PATH=/path/to/browser`.
@@ -38,8 +38,9 @@ The smoke script uses the first available Chromium-family browser and can be for
 4. Click `Capture current page`.
 5. Optionally save `My Profile` and `Portfolio Cases` in Options.
 6. Open the side panel, click `Extract fields`, review/correct extracted fields, then click `Score`.
-7. Click `Generate proposal` to create an editable local draft, review unsupported claims, then copy the text manually.
-8. Record proposal sent, viewed, replied, interview, hired, or lost events in the local `Outcome` panel.
+7. Create or link a `Client history` record when the same client should share history across opportunities.
+8. Click `Generate proposal` to create an editable local draft, review unsupported claims, then copy the text manually.
+9. Record proposal sent, viewed, replied, interview, hired, or lost events in the local `Outcome` panel.
 
 If an Upwork job key can be recognized from the current URL, repeated captures of the same job are automatically appended to the same opportunity.
 

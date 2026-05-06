@@ -21,6 +21,7 @@ const smokeProfileId = "profile_smoke_notes_failure";
 const smokeScoreId = "score_smoke_notes_failure";
 const smokeProposalId = "proposal_smoke_notes_failure";
 const smokeOutcomeId = "outcome_smoke_notes_failure";
+const smokeClientId = "client_smoke_notes_failure";
 let chromeProcess = null;
 let client = null;
 
@@ -166,6 +167,9 @@ async function smokeSidePanelPage(extensionId) {
     "#archiveProposalButton",
     "#proposalOutput",
     "#proposalRiskPanel",
+    "#clientRecordSelect",
+    "#saveClientButton",
+    "#clientHistoryPanel",
     "#outcomeFilter",
     "#outcomeEventType",
     "#saveOutcomeEventButton",
@@ -188,6 +192,9 @@ async function smokeSidePanelPage(extensionId) {
       document.querySelector("#profileConflictsPanel").textContent.includes("Corrected smoke title") &&
       document.querySelector("#proposalOutput").value.includes("Smoke proposal text") &&
       document.querySelector("#proposalRiskPanel").textContent.includes("Unsupported smoke claim") &&
+      document.querySelector("#clientBadge").textContent === "Linked" &&
+      document.querySelector("#clientSummaryPanel").textContent.includes("1 seen") &&
+      document.querySelector("#clientHistoryPanel").textContent.includes("Smoke notes failure") &&
       document.querySelector("#outcomeBadge").textContent === "Applied" &&
       document.querySelector("#outcomeTimeline").textContent.includes("Proposal sent") &&
       document.querySelector("#outcomeSummaryPanel").textContent.includes("connects 6") &&
@@ -239,6 +246,7 @@ async function seedSmokeOpportunity(sessionId) {
         jobKey: "smoke-notes-failure",
         platform: "upwork",
         status: OPPORTUNITY_STATUS.captured,
+        clientRecordId: smokeClientId,
         snapshotIds: [],
         currentProfileId: smokeProfileId,
         currentScoreResultId: smokeScoreId,
@@ -398,7 +406,27 @@ async function seedSmokeOpportunity(sessionId) {
         correctionOfEventId: null,
         voidedAt: null
       }],
-      [STORAGE_KEYS.clientRecords]: [],
+      [STORAGE_KEYS.clientRecords]: [{
+        id: smokeClientId,
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: now,
+        updatedAt: now,
+        primaryClientKey: "manual:smoke-client",
+        identitySources: [{
+          source: "manual",
+          value: "manual:smoke-client",
+          label: "Smoke client",
+          opportunityId: smokeOpportunityId,
+          snapshotId: null,
+          createdAt: now
+        }],
+        displayName: "Smoke client",
+        notes: "Smoke client notes",
+        redFlags: ["Smoke red flag"],
+        mergeHistory: [],
+        splitHistory: [],
+        archivedAt: null
+      }],
       [STORAGE_KEYS.fieldSelectors]: [],
       [STORAGE_KEYS.analyticsCache]: {}
     })})

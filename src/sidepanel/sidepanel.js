@@ -18,6 +18,22 @@ const profileReviewBadge = document.querySelector("#profileReviewBadge");
 const profileFieldsPanel = document.querySelector("#profileFieldsPanel");
 const profileConflictsPanel = document.querySelector("#profileConflictsPanel");
 const summaryPanel = document.querySelector("#summaryPanel");
+const clientBadge = document.querySelector("#clientBadge");
+const clientSummaryPanel = document.querySelector("#clientSummaryPanel");
+const clientRecordSelect = document.querySelector("#clientRecordSelect");
+const clientPrimaryKey = document.querySelector("#clientPrimaryKey");
+const clientDisplayName = document.querySelector("#clientDisplayName");
+const clientNotes = document.querySelector("#clientNotes");
+const clientRedFlags = document.querySelector("#clientRedFlags");
+const saveClientButton = document.querySelector("#saveClientButton");
+const linkClientButton = document.querySelector("#linkClientButton");
+const unlinkClientButton = document.querySelector("#unlinkClientButton");
+const splitClientButton = document.querySelector("#splitClientButton");
+const archiveClientButton = document.querySelector("#archiveClientButton");
+const clientMergeSourceSelect = document.querySelector("#clientMergeSourceSelect");
+const clientMergeTargetSelect = document.querySelector("#clientMergeTargetSelect");
+const mergeClientButton = document.querySelector("#mergeClientButton");
+const clientHistoryPanel = document.querySelector("#clientHistoryPanel");
 const snapshotsList = document.querySelector("#snapshotsList");
 const detailsPanel = document.querySelector("#detailsPanel");
 const generateProposalButton = document.querySelector("#generateProposalButton");
@@ -42,6 +58,7 @@ const voidOutcomeEventButton = document.querySelector("#voidOutcomeEventButton")
 const outcomeTimeline = document.querySelector("#outcomeTimeline");
 
 let opportunities = [];
+let clientRecords = [];
 let selectedId = null;
 let selectedOpportunity = null;
 let selectedOutcomeFilter = "";
@@ -80,11 +97,22 @@ function bindEvents() {
   archiveProposalButton.addEventListener("click", archiveProposal);
   saveOutcomeEventButton.addEventListener("click", saveOutcomeEvent);
   voidOutcomeEventButton.addEventListener("click", voidSelectedOutcomeEvent);
+  clientRecordSelect.addEventListener("change", renderClientFormFromSelection);
+  saveClientButton.addEventListener("click", saveClientRecord);
+  linkClientButton.addEventListener("click", linkSelectedClient);
+  unlinkClientButton.addEventListener("click", unlinkSelectedClient);
+  splitClientButton.addEventListener("click", splitCurrentOpportunityFromClient);
+  archiveClientButton.addEventListener("click", archiveSelectedClient);
+  mergeClientButton.addEventListener("click", mergeSelectedClients);
 }
 
 async function refresh() {
-  const response = await send({ type: "opportunities:listSummary" });
-  opportunities = response.opportunities || [];
+  const [opportunityResponse, clientResponse] = await Promise.all([
+    send({ type: "opportunities:listSummary" }),
+    send({ type: "clients:list" })
+  ]);
+  opportunities = opportunityResponse.opportunities || [];
+  clientRecords = clientResponse.clientRecords || [];
   const visible = getVisibleOpportunities();
   if (!selectedId || !visible.some((item) => item.id === selectedId)) {
     selectedId = visible[0]?.id || "";
@@ -148,7 +176,7 @@ async function permanentDeleteSelected() {
   if (!selectedId) return;
   const opportunity = getSelected();
   const title = opportunity?.title || "this opportunity";
-  const warning = `Permanently delete "${title}" and its snapshots, notes, profiles, scores, proposals, and outcomes? This cannot be undone.`;
+  const warning = `Permanently delete "${title}" and its snapshots, notes, profiles, scores, proposals, outcomes, and client links? This cannot be undone.`;
   if (!confirm(warning)) return;
   if (prompt("Type DELETE to permanently delete this opportunity.") !== "DELETE") {
     setStatus("Permanent delete canceled");
@@ -350,6 +378,120 @@ async function voidSelectedOutcomeEvent() {
   }
 }
 
+async function saveClientRecord() {
+  if (!selectedId) return;
+  setStatus("Saving client...");
+  setBusy(true);
+  try {
+    const id = clientRecordSelect.value;
+    if (id) {
+      await send({ type: "clients:update", id, clientRecord: collectClientRecordInput() });
+    } else {
+      await send({ type: "clients:create", opportunityId: selectedId, clientRecord: collectClientRecordInput() });
+    }
+    setStatus("Client saved");
+    await refresh();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function linkSelectedClient() {
+  if (!selectedId || !clientRecordSelect.value) return;
+  setStatus("Linking client...");
+  setBusy(true);
+  try {
+    const response = await send({
+      type: "clients:linkOpportunity",
+      opportunityId: selectedId,
+      id: clientRecordSelect.value
+    });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Client linked");
+    await refresh();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function unlinkSelectedClient() {
+  if (!selectedId || !selectedOpportunity?.clientRecordId) return;
+  setStatus("Unlinking client...");
+  setBusy(true);
+  try {
+    const response = await send({ type: "clients:unlinkOpportunity", opportunityId: selectedId });
+    selectedOpportunity = response.opportunity;
+    updateOpportunitySummary(response.opportunity);
+    setStatus("Client unlinked");
+    await refresh();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function archiveSelectedClient() {
+  const id = clientRecordSelect.value || selectedOpportunity?.clientRecordId;
+  if (!id) return;
+  if (!confirm("Archive this client record and unlink its opportunities?")) return;
+  setStatus("Archiving client...");
+  setBusy(true);
+  try {
+    await send({ type: "clients:archive", id });
+    setStatus("Client archived");
+    await refresh();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function mergeSelectedClients() {
+  const sourceId = clientMergeSourceSelect.value;
+  const targetId = clientMergeTargetSelect.value;
+  if (!sourceId || !targetId || sourceId === targetId) return;
+  if (!confirm("Merge source client into target client?")) return;
+  setStatus("Merging clients...");
+  setBusy(true);
+  try {
+    await send({ type: "clients:merge", sourceId, targetId });
+    setStatus("Clients merged");
+    await refresh();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function splitCurrentOpportunityFromClient() {
+  const sourceId = selectedOpportunity?.clientRecordId;
+  if (!selectedId || !sourceId) return;
+  setStatus("Splitting client...");
+  setBusy(true);
+  try {
+    await send({
+      type: "clients:split",
+      sourceId,
+      opportunityIds: [selectedId],
+      clientRecord: collectClientRecordInput({ forceNewKey: true })
+    });
+    setStatus("Client split");
+    await refresh();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function renderOpportunitySelect() {
   opportunitySelect.innerHTML = "";
   outcomeFilter.value = selectedOutcomeFilter;
@@ -383,6 +525,7 @@ function renderSelected() {
     snapshotsList.textContent = "No snapshots.";
     detailsPanel.textContent = "No score yet.";
     notesInput.value = "";
+    renderClient(null);
     renderProfileEditor(null);
     renderProposal(null);
     renderOutcome(null);
@@ -391,6 +534,7 @@ function renderSelected() {
 
   notesInput.value = opportunity.notes || "";
   renderSummary(opportunity);
+  renderClient(opportunity);
   renderProfileEditor(opportunity);
   renderSnapshots(opportunity);
   renderDetails(opportunity);
@@ -422,6 +566,123 @@ function renderSummary(opportunity) {
     ${profileWarning}
     <a href="${escapeAttribute(opportunity.mainUrl)}" target="_blank" rel="noreferrer">Open source page</a>
   `;
+}
+
+function renderClient(opportunity) {
+  renderClientSelects(opportunity);
+  const clientRecord = opportunity?.clientRecord || null;
+  saveClientButton.disabled = !opportunity;
+  linkClientButton.disabled = !opportunity || !clientRecordSelect.value;
+  unlinkClientButton.disabled = !opportunity?.clientRecordId;
+  splitClientButton.disabled = !opportunity?.clientRecordId;
+  archiveClientButton.disabled = !clientRecordSelect.value && !opportunity?.clientRecordId;
+  mergeClientButton.disabled = !clientMergeSourceSelect.value || !clientMergeTargetSelect.value || clientMergeSourceSelect.value === clientMergeTargetSelect.value;
+
+  if (!opportunity) {
+    clientBadge.className = "badge";
+    clientBadge.textContent = "Unlinked";
+    clientSummaryPanel.className = "details empty";
+    clientSummaryPanel.textContent = "No client record.";
+    clearClientForm();
+    clientHistoryPanel.className = "list empty";
+    clientHistoryPanel.textContent = "No client history.";
+    return;
+  }
+
+  if (clientRecord) {
+    clientBadge.className = "badge reviewed";
+    clientBadge.textContent = "Linked";
+    clientSummaryPanel.className = "details";
+    clientSummaryPanel.innerHTML = renderClientSummary(clientRecord);
+    clientHistoryPanel.className = clientRecord.summary?.opportunities?.length ? "list" : "list empty";
+    clientHistoryPanel.innerHTML = renderClientHistory(clientRecord);
+    fillClientForm(clientRecord);
+    return;
+  }
+
+  clientBadge.className = "badge";
+  clientBadge.textContent = "Unlinked";
+  clientSummaryPanel.className = "details empty";
+  clientSummaryPanel.textContent = "No client record.";
+  renderClientFormFromSelection();
+  clientHistoryPanel.className = "list empty";
+  clientHistoryPanel.textContent = "No client history.";
+}
+
+function renderClientSelects(opportunity) {
+  const linkedClientId = opportunity?.clientRecordId || "";
+  fillSelect(clientRecordSelect, clientRecords, "New client", linkedClientId);
+  fillSelect(clientMergeSourceSelect, clientRecords, "Source", linkedClientId);
+  const defaultTarget = clientRecords.find((item) => item.id !== clientMergeSourceSelect.value)?.id || "";
+  fillSelect(clientMergeTargetSelect, clientRecords, "Target", defaultTarget);
+}
+
+function fillSelect(select, records, emptyLabel, selectedValue) {
+  select.innerHTML = "";
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = emptyLabel;
+  select.append(empty);
+  for (const record of records) {
+    const option = document.createElement("option");
+    option.value = record.id;
+    option.textContent = `${record.displayName} (${record.summary?.seenCount || 0})`;
+    select.append(option);
+  }
+  select.value = selectedValue || "";
+}
+
+function renderClientSummary(clientRecord) {
+  const summary = clientRecord.summary || {};
+  return `
+    <article class="dimension">
+      <header><strong>${escapeHtml(clientRecord.displayName)}</strong><span>${escapeHtml(summary.seenCount || 0)} seen</span></header>
+      <small>key ${escapeHtml(clientRecord.primaryClientKey)}</small>
+      <small>average score ${escapeHtml(summary.averageScore ?? "none")}</small>
+      <small>previous outcomes ${(summary.previousOutcomes || []).map((item) => escapeHtml(outcomeLabel(item.status))).join(", ") || "none"}</small>
+      ${clientRecord.notes ? `<small>${escapeHtml(clientRecord.notes)}</small>` : ""}
+      ${(clientRecord.redFlags || []).length ? `<small>red flags ${escapeHtml(clientRecord.redFlags.join("; "))}</small>` : ""}
+    </article>
+  `;
+}
+
+function renderClientHistory(clientRecord) {
+  const opportunities = clientRecord.summary?.opportunities || [];
+  if (!opportunities.length) return "No client history.";
+  return opportunities.map((item) => `
+    <div class="snapshot">
+      <strong>${escapeHtml(item.title)}</strong>
+      <span>${escapeHtml(item.totalScore ?? "no score")}</span>
+      <small>${escapeHtml(outcomeLabel(item.outcomeStatus))}</small>
+      <small>${escapeHtml(formatDateTime(item.updatedAt))}</small>
+    </div>
+  `).join("");
+}
+
+function renderClientFormFromSelection() {
+  const selected = clientRecords.find((item) => item.id === clientRecordSelect.value) || null;
+  if (selected) {
+    fillClientForm(selected);
+    linkClientButton.disabled = !selectedId;
+    archiveClientButton.disabled = false;
+    return;
+  }
+  if (!selectedOpportunity?.clientRecord) clearClientForm();
+  linkClientButton.disabled = true;
+}
+
+function fillClientForm(clientRecord) {
+  clientDisplayName.value = clientRecord.displayName || "";
+  clientPrimaryKey.value = clientRecord.primaryClientKey || "";
+  clientNotes.value = clientRecord.notes || "";
+  clientRedFlags.value = (clientRecord.redFlags || []).join("\n");
+}
+
+function clearClientForm() {
+  clientDisplayName.value = "";
+  clientPrimaryKey.value = "";
+  clientNotes.value = "";
+  clientRedFlags.value = "";
 }
 
 function renderProfileEditor(opportunity) {
@@ -752,6 +1013,18 @@ function collectOutcomeEventInput() {
   };
 }
 
+function collectClientRecordInput({ forceNewKey = false } = {}) {
+  return {
+    displayName: clientDisplayName.value,
+    primaryClientKey: forceNewKey ? "" : clientPrimaryKey.value,
+    notes: clientNotes.value,
+    redFlags: clientRedFlags.value
+      .split(/\n|,/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  };
+}
+
 function getVisibleOpportunities() {
   if (!selectedOutcomeFilter) return opportunities;
   return opportunities.filter((item) => (item.outcomeSummary?.status || OUTCOME_STATUS.notApplied) === selectedOutcomeFilter);
@@ -802,6 +1075,19 @@ function setBusy(isBusy) {
   archiveProposalButton.disabled = isBusy || !selectedOpportunity?.proposalDraft;
   saveOutcomeEventButton.disabled = isBusy || !selectedId;
   voidOutcomeEventButton.disabled = isBusy || !selectedOutcomeEventId();
+  clientRecordSelect.disabled = isBusy;
+  clientPrimaryKey.disabled = isBusy;
+  clientDisplayName.disabled = isBusy;
+  clientNotes.disabled = isBusy;
+  clientRedFlags.disabled = isBusy;
+  saveClientButton.disabled = isBusy || !selectedId;
+  linkClientButton.disabled = isBusy || !selectedId || !clientRecordSelect.value;
+  unlinkClientButton.disabled = isBusy || !selectedOpportunity?.clientRecordId;
+  splitClientButton.disabled = isBusy || !selectedOpportunity?.clientRecordId;
+  archiveClientButton.disabled = isBusy || (!clientRecordSelect.value && !selectedOpportunity?.clientRecordId);
+  clientMergeSourceSelect.disabled = isBusy;
+  clientMergeTargetSelect.disabled = isBusy;
+  mergeClientButton.disabled = isBusy || !clientMergeSourceSelect.value || !clientMergeTargetSelect.value || clientMergeSourceSelect.value === clientMergeTargetSelect.value;
 }
 
 function setStatus(message) {
