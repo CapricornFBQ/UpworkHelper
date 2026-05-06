@@ -15,6 +15,13 @@ Local Chrome MV3 extension for manually capturing Upwork pages into opportunity 
 
 - Long-term implementation plan: `docs/LONG_TERM_PLAN.md`
 
+## Validation
+
+- Core business handler regression: `node scripts/validate_v0_2.mjs`
+- Unpacked extension smoke: `node scripts/smoke_unpacked_extension.mjs`
+
+The smoke script uses the first available Chromium-family browser and can be forced with `CHROME_PATH=/path/to/browser`.
+
 ## Load in Chrome
 
 1. Open `chrome://extensions`.

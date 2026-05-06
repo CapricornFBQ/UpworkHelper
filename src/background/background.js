@@ -11,6 +11,7 @@ import { mapRawProfileFields, normalizeDimensions, normalizeRawScore } from "../
 
 const MAX_SNAPSHOT_CHARS = 70000;
 const MAX_SCORE_INPUT_CHARS = 110000;
+const SNAPSHOT_COMPACT_CHARS = 2000;
 const BACKUP_PREFIX = "uosc_backup_v0_to_v1_";
 const SCORE_DECISIONS = ["strong_apply", "targeted_apply", "only_if_strong_fit", "skip"];
 const MANAGED_STORAGE_KEYS = Object.freeze(Object.values(STORAGE_KEYS));
@@ -51,6 +52,12 @@ async function handleMessage(message) {
       return { ok: true, settings: await saveSettings(message.settings || {}) };
     case "data:getStorageUsage":
       return { ok: true, usage: await getStorageUsage() };
+    case "snapshots:getRetentionSummary":
+      return { ok: true, summary: await getSnapshotRetentionSummary() };
+    case "snapshots:compactText":
+      return { ok: true, result: await compactSnapshotText() };
+    case "snapshots:redactText":
+      return { ok: true, result: await redactSnapshotText() };
     case "data:createBackup":
       return { ok: true, backupKey: await createBackup() };
     case "data:export":
@@ -326,6 +333,117 @@ async function getStorageUsage() {
   return {
     bytesInUse,
     quotaBytes: chrome.storage.local.QUOTA_BYTES || null
+  };
+}
+
+async function getSnapshotRetentionSummary() {
+  const store = await readStore();
+  return summarizeSnapshotRetention(store.snapshots);
+}
+
+async function compactSnapshotText() {
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const before = summarizeSnapshotRetention(store.snapshots);
+    const compactedAt = new Date().toISOString();
+    const candidates = store.snapshots.filter((snapshot) => {
+      const text = String(snapshot.text || "");
+      return snapshot.retentionState === SNAPSHOT_RETENTION_STATE.full && text.length > SNAPSHOT_COMPACT_CHARS;
+    });
+    let backupKey = null;
+    if (candidates.length > 0) backupKey = await createBackup();
+
+    for (const snapshot of candidates) {
+      const text = String(snapshot.text || "");
+      const compactedText = [
+        text.slice(0, SNAPSHOT_COMPACT_CHARS).trimEnd(),
+        "",
+        `[Compacted locally. Original text chars: ${text.length}.]`
+      ].join("\n");
+      snapshot.stats = {
+        ...(snapshot.stats || {}),
+        originalTextCharCount: text.length,
+        originalTextHash: snapshot.textHash || null,
+        compactedCharCount: compactedText.length,
+        compactedAt
+      };
+      snapshot.text = compactedText;
+      snapshot.textHash = await hashText(compactedText);
+      snapshot.retentionState = SNAPSHOT_RETENTION_STATE.compacted;
+    }
+
+    if (candidates.length > 0) await writeStore(store);
+
+    return {
+      updatedCount: candidates.length,
+      backupKey,
+      before,
+      after: summarizeSnapshotRetention(store.snapshots)
+    };
+  });
+}
+
+async function redactSnapshotText() {
+  return withStorageLock(async () => {
+    const store = await readStore();
+    const before = summarizeSnapshotRetention(store.snapshots);
+    const redactedAt = new Date().toISOString();
+    const candidates = store.snapshots.filter((snapshot) => String(snapshot.text || "").length > 0);
+    let backupKey = null;
+    if (candidates.length > 0) backupKey = await createBackup();
+
+    for (const snapshot of candidates) {
+      const text = String(snapshot.text || "");
+      snapshot.stats = {
+        ...(snapshot.stats || {}),
+        originalTextCharCount: snapshot.stats?.originalTextCharCount || text.length,
+        originalTextHash: snapshot.stats?.originalTextHash || snapshot.textHash || null,
+        redactedAt
+      };
+      snapshot.text = "";
+      snapshot.textHash = await hashText("");
+      snapshot.retentionState = SNAPSHOT_RETENTION_STATE.redacted;
+    }
+
+    if (candidates.length > 0) await writeStore(store);
+
+    return {
+      updatedCount: candidates.length,
+      backupKey,
+      before,
+      after: summarizeSnapshotRetention(store.snapshots)
+    };
+  });
+}
+
+function summarizeSnapshotRetention(snapshots) {
+  const counts = {
+    [SNAPSHOT_RETENTION_STATE.full]: 0,
+    [SNAPSHOT_RETENTION_STATE.redacted]: 0,
+    [SNAPSHOT_RETENTION_STATE.compacted]: 0,
+    [SNAPSHOT_RETENTION_STATE.deletedReferenceOnly]: 0,
+    unknown: 0
+  };
+  let textChars = 0;
+  let snapshotsWithText = 0;
+  let compactableCount = 0;
+
+  for (const snapshot of snapshots || []) {
+    const state = snapshot.retentionState || "unknown";
+    counts[state] = (counts[state] ?? 0) + 1;
+    const textLength = String(snapshot.text || "").length;
+    textChars += textLength;
+    if (textLength > 0) snapshotsWithText += 1;
+    if (state === SNAPSHOT_RETENTION_STATE.full && textLength > SNAPSHOT_COMPACT_CHARS) compactableCount += 1;
+  }
+
+  return {
+    totalSnapshots: (snapshots || []).length,
+    snapshotsWithText,
+    compactableCount,
+    textChars,
+    compactChars: SNAPSHOT_COMPACT_CHARS,
+    counts
   };
 }
 

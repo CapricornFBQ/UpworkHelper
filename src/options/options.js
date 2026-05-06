@@ -1,9 +1,12 @@
 const form = document.querySelector("#settingsForm");
 const saveStatus = document.querySelector("#saveStatus");
 const storageUsage = document.querySelector("#storageUsage");
+const retentionSummary = document.querySelector("#retentionSummary");
 const refreshUsageButton = document.querySelector("#refreshUsageButton");
 const createBackupButton = document.querySelector("#createBackupButton");
 const exportButton = document.querySelector("#exportButton");
+const compactSnapshotsButton = document.querySelector("#compactSnapshotsButton");
+const redactSnapshotsButton = document.querySelector("#redactSnapshotsButton");
 const exportOutput = document.querySelector("#exportOutput");
 const importInput = document.querySelector("#importInput");
 const previewImportButton = document.querySelector("#previewImportButton");
@@ -49,6 +52,8 @@ function bindEvents() {
   refreshUsageButton.addEventListener("click", refreshStorageUsage);
   createBackupButton.addEventListener("click", createBackup);
   exportButton.addEventListener("click", exportJson);
+  compactSnapshotsButton.addEventListener("click", compactSnapshots);
+  redactSnapshotsButton.addEventListener("click", redactSnapshotText);
   previewImportButton.addEventListener("click", previewImport);
   commitImportButton.addEventListener("click", commitImport);
 }
@@ -58,8 +63,18 @@ async function refreshStorageUsage() {
     const { usage } = await send({ type: "data:getStorageUsage" });
     const quota = usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : "";
     storageUsage.textContent = `${formatBytes(usage.bytesInUse)}${quota} used`;
+    await refreshRetentionSummary();
   } catch (error) {
     storageUsage.textContent = error.message;
+  }
+}
+
+async function refreshRetentionSummary() {
+  try {
+    const { summary } = await send({ type: "snapshots:getRetentionSummary" });
+    retentionSummary.textContent = formatRetentionSummary(summary);
+  } catch (error) {
+    retentionSummary.textContent = error.message;
   }
 }
 
@@ -80,6 +95,36 @@ async function exportJson() {
     const { exportData } = await send({ type: "data:export" });
     exportOutput.value = JSON.stringify(exportData, null, 2);
     dataStatus.textContent = "Export ready. API key excluded.";
+    await refreshStorageUsage();
+  } catch (error) {
+    dataStatus.textContent = error.message;
+  }
+}
+
+async function compactSnapshots() {
+  const message = "Compact large full snapshot text? A backup will be created before changes.";
+  if (!confirm(message)) return;
+  dataStatus.textContent = "Compacting snapshots...";
+  try {
+    const { result } = await send({ type: "snapshots:compactText" });
+    dataStatus.textContent = `Compacted ${result.updatedCount} snapshots${result.backupKey ? `. Backup: ${result.backupKey}` : ""}`;
+    await refreshStorageUsage();
+  } catch (error) {
+    dataStatus.textContent = error.message;
+  }
+}
+
+async function redactSnapshotText() {
+  const message = "Redact all stored snapshot text? A backup will be created before changes. Existing scores remain, but redacted snapshots cannot be used for future scoring.";
+  if (!confirm(message)) return;
+  if (prompt("Type REDACT to remove stored snapshot text.") !== "REDACT") {
+    dataStatus.textContent = "Redaction canceled";
+    return;
+  }
+  dataStatus.textContent = "Redacting snapshot text...";
+  try {
+    const { result } = await send({ type: "snapshots:redactText" });
+    dataStatus.textContent = `Redacted ${result.updatedCount} snapshots${result.backupKey ? `. Backup: ${result.backupKey}` : ""}`;
     await refreshStorageUsage();
   } catch (error) {
     dataStatus.textContent = error.message;
@@ -122,6 +167,22 @@ function formatEntityCounts(counts = {}) {
   return Object.entries(counts)
     .map(([key, value]) => `${key}: ${value}`)
     .join(", ");
+}
+
+function formatRetentionSummary(summary = {}) {
+  const counts = summary.counts || {};
+  return [
+    `Snapshots: ${summary.totalSnapshots || 0}`,
+    `with text: ${summary.snapshotsWithText || 0}`,
+    `text: ${formatNumber(summary.textChars || 0)} chars`,
+    `full: ${counts.full || 0}`,
+    `compacted: ${counts.compacted || 0}`,
+    `redacted: ${counts.redacted || 0}`
+  ].join(" · ");
+}
+
+function formatNumber(value) {
+  return new Intl.NumberFormat().format(Number(value || 0));
 }
 
 function formatBytes(bytes) {

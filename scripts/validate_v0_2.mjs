@@ -204,6 +204,7 @@ assert.equal(sendBackgroundMessage.storageData[STORAGE_KEYS.meta].importMode, "r
 await runSettingsExportBackupTests();
 await runMigrationTests();
 await runCaptureTests();
+await runSnapshotRetentionTests();
 await runArchiveRestoreDeleteTests();
 await runNotesStaleTests();
 await runScoreTests();
@@ -355,6 +356,62 @@ async function runCaptureTests() {
   const archived = await harness({ type: "capture:currentPage", opportunityId });
   assert.equal(archived.ok, false);
   assert.match(archived.error, /Archived opportunities/);
+}
+
+async function runSnapshotRetentionTests() {
+  const longText = "Long snapshot text. ".repeat(180);
+  const shortText = "Short snapshot text.";
+  const harness = await loadBackgroundForValidation({
+    storageData: {
+      [STORAGE_KEYS.opportunities]: [
+        makeOpportunity("opp_retention", { snapshotIds: ["snap_long", "snap_short"] })
+      ],
+      [STORAGE_KEYS.snapshots]: [
+        makeSnapshot("snap_long", "opp_retention", {
+          text: longText,
+          textHash: "original_long_hash",
+          stats: { charCount: longText.length, capturedCharCount: longText.length }
+        }),
+        makeSnapshot("snap_short", "opp_retention", {
+          text: shortText,
+          textHash: "original_short_hash",
+          stats: { charCount: shortText.length, capturedCharCount: shortText.length }
+        })
+      ]
+    }
+  });
+
+  const summary = await harness({ type: "snapshots:getRetentionSummary" });
+  assert.equal(summary.ok, true);
+  assert.equal(summary.summary.totalSnapshots, 2);
+  assert.equal(summary.summary.snapshotsWithText, 2);
+  assert.equal(summary.summary.compactableCount, 1);
+  assert.equal(summary.summary.counts.full, 2);
+
+  const compact = await harness({ type: "snapshots:compactText" });
+  assert.equal(compact.ok, true);
+  assert.equal(compact.result.updatedCount, 1);
+  assert.ok(compact.result.backupKey);
+  assert.equal(harness.storageData[compact.result.backupKey].data[STORAGE_KEYS.snapshots][0].text, longText);
+  const compacted = harness.storageData[STORAGE_KEYS.snapshots].find((item) => item.id === "snap_long");
+  assert.equal(compacted.retentionState, SNAPSHOT_RETENTION_STATE.compacted);
+  assert.ok(compacted.text.length < longText.length);
+  assert.equal(compacted.stats.originalTextCharCount, longText.length);
+  assert.equal(compacted.stats.originalTextHash, "original_long_hash");
+  assert.notEqual(compacted.textHash, "original_long_hash");
+
+  const redact = await harness({ type: "snapshots:redactText" });
+  assert.equal(redact.ok, true);
+  assert.equal(redact.result.updatedCount, 2);
+  assert.ok(redact.result.backupKey);
+  for (const snapshot of harness.storageData[STORAGE_KEYS.snapshots]) {
+    assert.equal(snapshot.text, "");
+    assert.equal(snapshot.retentionState, SNAPSHOT_RETENTION_STATE.redacted);
+    assert.ok(snapshot.stats.redactedAt);
+  }
+  const redactedSummary = await harness({ type: "snapshots:getRetentionSummary" });
+  assert.equal(redactedSummary.summary.snapshotsWithText, 0);
+  assert.equal(redactedSummary.summary.counts.redacted, 2);
 }
 
 async function runArchiveRestoreDeleteTests() {
@@ -568,19 +625,19 @@ async function loadBackgroundForValidation(options = {}) {
       local: {
         QUOTA_BYTES: 10 * 1024 * 1024,
         async get(keys) {
-          if (keys === null) return { ...storageData };
+          if (keys === null) return clone(storageData);
           if (Array.isArray(keys)) {
             return Object.fromEntries(
               keys
                 .filter((key) => Object.prototype.hasOwnProperty.call(storageData, key))
-                .map((key) => [key, storageData[key]])
+                .map((key) => [key, clone(storageData[key])])
             );
           }
-          if (typeof keys === "string") return { [keys]: storageData[keys] };
+          if (typeof keys === "string") return { [keys]: clone(storageData[keys]) };
           return {};
         },
         async set(values) {
-          Object.assign(storageData, values);
+          Object.assign(storageData, clone(values));
         },
         async remove(keys) {
           const keyList = Array.isArray(keys) ? keys : [keys];
@@ -823,4 +880,8 @@ async function waitUntil(predicate) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function clone(value) {
+  return value === undefined ? undefined : structuredClone(value);
 }

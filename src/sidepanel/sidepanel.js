@@ -3,6 +3,7 @@ const opportunitySelect = document.querySelector("#opportunitySelect");
 const captureButton = document.querySelector("#captureButton");
 const scoreButton = document.querySelector("#scoreButton");
 const deleteButton = document.querySelector("#deleteButton");
+const permanentDeleteButton = document.querySelector("#permanentDeleteButton");
 const refreshButton = document.querySelector("#refreshButton");
 const notesInput = document.querySelector("#notesInput");
 const saveNotesButton = document.querySelector("#saveNotesButton");
@@ -30,6 +31,7 @@ function bindEvents() {
   captureButton.addEventListener("click", captureCurrentPage);
   scoreButton.addEventListener("click", scoreSelected);
   deleteButton.addEventListener("click", deleteSelected);
+  permanentDeleteButton.addEventListener("click", permanentDeleteSelected);
   saveNotesButton.addEventListener("click", saveNotes);
 }
 
@@ -94,6 +96,30 @@ async function deleteSelected() {
   await refresh();
 }
 
+async function permanentDeleteSelected() {
+  if (!selectedId) return;
+  const opportunity = getSelected();
+  const title = opportunity?.title || "this opportunity";
+  const warning = `Permanently delete "${title}" and its snapshots, notes, profiles, and scores? This cannot be undone.`;
+  if (!confirm(warning)) return;
+  if (prompt("Type DELETE to permanently delete this opportunity.") !== "DELETE") {
+    setStatus("Permanent delete canceled");
+    return;
+  }
+  setStatus("Deleting permanently...");
+  setBusy(true);
+  try {
+    await send({ type: "opportunities:deletePermanent", id: selectedId });
+    selectedId = "";
+    setStatus("Opportunity permanently deleted");
+    await refresh();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function saveNotes() {
   if (!selectedId) return;
   setStatus("Saving notes...");
@@ -132,6 +158,7 @@ function renderSelected() {
   captureButton.disabled = false;
   scoreButton.disabled = !opportunity;
   deleteButton.disabled = !opportunity;
+  permanentDeleteButton.disabled = !opportunity;
   saveNotesButton.disabled = !opportunity;
 
   if (!opportunity) {
@@ -252,6 +279,7 @@ function setBusy(isBusy) {
   captureButton.disabled = isBusy;
   scoreButton.disabled = isBusy || !selectedId;
   deleteButton.disabled = isBusy || !selectedId;
+  permanentDeleteButton.disabled = isBusy || !selectedId;
   saveNotesButton.disabled = isBusy || !selectedId;
 }
 
